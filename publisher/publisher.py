@@ -67,7 +67,8 @@ class Publisher:
                 'client_id': self.client_id,
                 'type': 'publisher',
                 'topics': self.topics,
-                'rates': self.publish_rates
+                'rates': self.publish_rates,
+                'broker_host': self.broker_host
             }
             
             self.client.publish(

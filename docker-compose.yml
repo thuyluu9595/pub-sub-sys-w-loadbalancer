@@ -9,7 +9,7 @@ services:
       - "1883:1883"
       - "9001:9001"
     volumes:
-      - ./mosquitto/broker1:/mosquitto/config
+      - ./mosquitto/broker1/config:/mosquitto/config
       - ./mosquitto/broker1/data:/mosquitto/data
       - ./mosquitto/broker1/log:/mosquitto/log
     networks:
@@ -23,7 +23,7 @@ services:
       - "1884:1883"
       - "9002:9001"
     volumes:
-      - ./mosquitto/broker2:/mosquitto/config
+      - ./mosquitto/broker2/config:/mosquitto/config
       - ./mosquitto/broker2/data:/mosquitto/data
       - ./mosquitto/broker2/log:/mosquitto/log
     networks:
@@ -37,7 +37,7 @@ services:
       - "1885:1883"
       - "9003:9001"
     volumes:
-      - ./mosquitto/broker3:/mosquitto/config
+      - ./mosquitto/broker3/config:/mosquitto/config
       - ./mosquitto/broker3/data:/mosquitto/data
       - ./mosquitto/broker3/log:/mosquitto/log
     networks:
@@ -51,7 +51,7 @@ services:
       - "1886:1883"
       - "9004:9001"
     volumes:
-      - ./mosquitto/broker4:/mosquitto/config
+      - ./mosquitto/broker4/config:/mosquitto/config
       - ./mosquitto/broker4/data:/mosquitto/data
       - ./mosquitto/broker4/log:/mosquitto/log
     networks:
@@ -106,7 +106,7 @@ services:
       - coordinator
     environment:
       - COORDINATOR_HOST=coordinator
-      - NUM_SUBSCRIBERS=50
+      - NUM_SUBSCRIBERS=20
     volumes:
       - ./subscriber:/app
     networks:

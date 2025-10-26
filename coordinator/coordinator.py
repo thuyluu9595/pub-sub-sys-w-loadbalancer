@@ -258,8 +258,17 @@ class LoadBalancer:
     def detect_and_balance(self):
         """Main load balancing routine"""
         # Get all topics with their request rates
-        request_rates = {topic: stats['rate'] 
-                        for topic, stats in self.topic_stats.items()}
+        # request_rates = {topic: stats['rate']
+        #                 for topic, stats in self.topic_stats.items()}
+
+        # Get all topics with their request rates
+        request_rates = {}
+        for topic, stats in self.topic_stats.items():
+            # This is the change: load = rate * subscribers
+            # This better reflects the paper's model
+            load = stats.get('rate', 0.0) * stats.get('subscribers', 0)
+            if load > 0:
+                request_rates[topic] = load
         
         if not request_rates:
             logger.info("No topics to balance")
@@ -323,7 +332,17 @@ class CoordinationService:
             brokers.append(BrokerInfo(host, port, capacity, data_rate))
         
         return brokers
-    
+
+    def _on_broker_connect(self, client, userdata, flags, rc, broker_idx):
+        """Callback when connected to a broker"""
+        logger.info(f"Coordinator connected to broker {broker_idx} with result code {rc}")
+        # Subscribe to stats topic
+        client.subscribe(f"$SYS/broker{broker_idx}/stats/#")
+
+    def _on_broker_message(self, client, userdata, msg):
+        """Handle messages from brokers"""
+        pass
+
     def _connect_to_brokers(self):
         """Connect to all brokers"""
         for i, broker in enumerate(self.brokers):
@@ -367,13 +386,14 @@ class CoordinationService:
                 client_id = payload['client_id']
                 client_type = payload['type']
                 topics = payload['topics']
+                broker_host = payload.get('broker_host')
                 
                 if client_type == 'publisher':
                     rates = payload.get('rates', {})
-                    self.register_publisher(client_id, topics, rates)
+                    self.register_publisher(client_id, topics, rates, broker_host)
                     logger.info(f"Registered publisher {client_id} with {len(topics)} topics")
                 elif client_type == 'subscriber':
-                    self.register_subscriber(client_id, topics)
+                    self.register_subscriber(client_id, topics, broker_host)
                     logger.info(f"Registered subscriber {client_id} with {len(topics)} topics")
             
             elif topic_parts[1] == 'stats':
@@ -381,10 +401,11 @@ class CoordinationService:
                 payload = json.loads(msg.payload.decode())
                 topic = payload['topic']
                 rate = payload.get('rate', 0.0)
-                num_subs = payload.get('subscribers', 0)
+                # num_subs = payload.get('subscribers', 0)
                 
                 with self.lock:
-                    self.load_balancer.update_topic_stats(topic, rate, num_subs)
+                    current_subs = self.load_balancer.topic_stats[topic].get('subscribers', 0)
+                    self.load_balancer.update_topic_stats(topic, rate, current_subs)
                 
         except Exception as e:
             logger.error(f"Error processing coordination message: {e}")
@@ -409,20 +430,20 @@ class CoordinationService:
         except Exception as e:
             logger.error(f"Failed to send migration command: {e}")
     
-    def register_publisher(self, client_id: str, topics: List[str], rates: Dict[str, float]):
+    def register_publisher(self, client_id: str, topics: List[str], rates: Dict[str, float], broker_host: str):
         """Register a publisher with its topics and rates"""
         with self.lock:
-            self.clients[client_id] = {'type': 'publisher', 'topics': topics}
+            self.clients[client_id] = {'type': 'publisher', 'topics': topics, 'broker_host': broker_host}
             
             for topic in topics:
                 rate = rates.get(topic, 1.0)
                 self.load_balancer.update_topic_stats(topic, rate, 0)
                 self.load_balancer.trie.insert(topic)
     
-    def register_subscriber(self, client_id: str, topics: List[str]):
+    def register_subscriber(self, client_id: str, topics: List[str], broker_host: str):
         """Register a subscriber with its topic subscriptions"""
         with self.lock:
-            self.clients[client_id] = {'type': 'subscriber', 'topics': topics}
+            self.clients[client_id] = {'type': 'subscriber', 'topics': topics, 'broker_host': broker_host}
             
             for topic in topics:
                 current_subs = self.load_balancer.topic_stats[topic]['subscribers']
@@ -432,10 +453,10 @@ class CoordinationService:
     def run_balancing_cycle(self):
         """Run load balancing cycle periodically"""
         # Wait for initial registrations
-        time.sleep(15)
+        time.sleep(10)
         
         while True:
-            time.sleep(10)  # Balance every 10 seconds
+            time.sleep(3)  # Balance every 3 seconds
             
             try:
                 with self.lock:

@@ -62,7 +62,8 @@ class Subscriber:
             registration = {
                 'client_id': self.client_id,
                 'type': 'subscriber',
-                'topics': self.topics
+                'topics': self.topics,
+                'broker_host': self.broker_host
             }
             
             self.client.publish(
