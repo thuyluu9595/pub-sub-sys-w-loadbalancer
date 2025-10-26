@@ -1,0 +1,120 @@
+version: '3.8'
+
+services:
+  # Mosquitto Brokers
+  broker1:
+    image: eclipse-mosquitto:2.0
+    container_name: mqtt_broker1
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mosquitto/broker1:/mosquitto/config
+      - ./mosquitto/broker1/data:/mosquitto/data
+      - ./mosquitto/broker1/log:/mosquitto/log
+    networks:
+      mqtt_network:
+        ipv4_address: 172.20.0.11
+
+  broker2:
+    image: eclipse-mosquitto:2.0
+    container_name: mqtt_broker2
+    ports:
+      - "1884:1883"
+      - "9002:9001"
+    volumes:
+      - ./mosquitto/broker2:/mosquitto/config
+      - ./mosquitto/broker2/data:/mosquitto/data
+      - ./mosquitto/broker2/log:/mosquitto/log
+    networks:
+      mqtt_network:
+        ipv4_address: 172.20.0.12
+
+  broker3:
+    image: eclipse-mosquitto:2.0
+    container_name: mqtt_broker3
+    ports:
+      - "1885:1883"
+      - "9003:9001"
+    volumes:
+      - ./mosquitto/broker3:/mosquitto/config
+      - ./mosquitto/broker3/data:/mosquitto/data
+      - ./mosquitto/broker3/log:/mosquitto/log
+    networks:
+      mqtt_network:
+        ipv4_address: 172.20.0.13
+
+  broker4:
+    image: eclipse-mosquitto:2.0
+    container_name: mqtt_broker4
+    ports:
+      - "1886:1883"
+      - "9004:9001"
+    volumes:
+      - ./mosquitto/broker4:/mosquitto/config
+      - ./mosquitto/broker4/data:/mosquitto/data
+      - ./mosquitto/broker4/log:/mosquitto/log
+    networks:
+      mqtt_network:
+        ipv4_address: 172.20.0.14
+
+  # Coordination Service - Load Balancer with Hot Topic Detection
+  coordinator:
+    build:
+      context: ./coordinator
+      dockerfile: Dockerfile
+    container_name: mqtt_coordinator
+    depends_on:
+      - broker1
+      - broker2
+      - broker3
+      - broker4
+    environment:
+      - BROKERS=broker1:1883,broker2:1883,broker3:1883,broker4:1883
+      - BROKER_CAPACITIES=350,450,550,600
+      - LOOP_THRESHOLD=0.8
+    volumes:
+      - ./coordinator:/app
+    networks:
+      - mqtt_network
+
+  # Publishers
+  publisher:
+    build:
+      context: ./publisher
+      dockerfile: Dockerfile
+    container_name: mqtt_publisher
+    depends_on:
+      - coordinator
+    environment:
+      - COORDINATOR_HOST=coordinator
+      - NUM_TOPICS=20
+      - PUBLISH_RATE_MIN=0.1
+      - PUBLISH_RATE_MAX=2.0
+    volumes:
+      - ./publisher:/app
+    networks:
+      - mqtt_network
+
+  # Subscribers
+  subscriber:
+    build:
+      context: ./subscriber
+      dockerfile: Dockerfile
+    container_name: mqtt_subscriber
+    depends_on:
+      - coordinator
+    environment:
+      - COORDINATOR_HOST=coordinator
+      - NUM_SUBSCRIBERS=50
+    volumes:
+      - ./subscriber:/app
+    networks:
+      - mqtt_network
+
+networks:
+  mqtt_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
