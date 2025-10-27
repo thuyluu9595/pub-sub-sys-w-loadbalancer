@@ -73,6 +73,8 @@ services:
       - BROKERS=broker1:1883,broker2:1883,broker3:1883,broker4:1883
       - BROKER_CAPACITIES=350,450,550,600
       - LOOP_THRESHOLD=0.8
+      - CONTROL_HOST=broker1
+      - CONTROL_PORT=1883
     volumes:
       - ./coordinator:/app
     networks:
@@ -91,6 +93,8 @@ services:
       - NUM_TOPICS=20
       - PUBLISH_RATE_MIN=0.1
       - PUBLISH_RATE_MAX=2.0
+      - CONTROL_HOST=broker1
+      - CONTROL_PORT=1883
     volumes:
       - ./publisher:/app
     networks:
@@ -107,6 +111,8 @@ services:
     environment:
       - COORDINATOR_HOST=coordinator
       - NUM_SUBSCRIBERS=20
+      - CONTROL_HOST=broker1
+      - CONTROL_PORT=1883
     volumes:
       - ./subscriber:/app
     networks:

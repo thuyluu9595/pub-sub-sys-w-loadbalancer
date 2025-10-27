@@ -12,6 +12,7 @@ import logging
 from typing import List, Dict
 from collections import defaultdict
 import threading
+import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -36,41 +37,49 @@ class Subscriber:
         self.lock = threading.Lock()
         self.migration_lock = threading.Lock()
         self.registered = False
-    
+
+        # Attributes for control broker
+        self.control_host = os.getenv("CONTROL_HOST", "broker1")
+        self.control_port = int(os.getenv("CONTROL_PORT", "1883"))
+        self.ctrl_client = mqtt.Client(f"{client_id}-ctrl")
+        self.ctrl_client.on_connect = self.on_ctrl_connect
+        self.ctrl_client.on_message = self.on_message
+
+    def on_ctrl_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            logger.info(f"Subscriber {self.client_id} connected to control broker")
+            self.ctrl_client.subscribe(f"coordinator/migrate/{self.client_id}")
+
+            # Register with coordinator if not already registered
+            if not self.registered and self.topics:
+                self.register_with_coordinator()
+        else:
+            logger.error(f"Connection to control broker failed with code {rc}")
+
     def on_connect(self, client, userdata, flags, rc):
         """Callback for when the client connects to the broker"""
         if rc == 0:
             logger.info(f"Subscriber {self.client_id} connected to {self.broker_host}:{self.broker_port}")
             
-            # Subscribe to migration commands
-            client.subscribe(f"coordinator/migrate/{self.client_id}")
-            
             # Subscribe to all topics
             for topic in self.topics:
                 self.client.subscribe(topic, qos=1)
                 logger.debug(f"Subscribed to {topic}")
-            
-            # Register with coordinator if not already registered
-            if not self.registered and self.topics:
-                self.register_with_coordinator()
+
         else:
             logger.error(f"Connection failed with code {rc}")
     
     def register_with_coordinator(self):
         """Register this subscriber with the coordinator"""
         try:
-            registration = {
+            self.ctrl_client.publish(f"coordinator/register/subscriber", json.dumps({
                 'client_id': self.client_id,
                 'type': 'subscriber',
                 'topics': self.topics,
-                'broker_host': self.broker_host
-            }
-            
-            self.client.publish(
-                "coordinator/register/subscriber",
-                json.dumps(registration),
-                qos=1
-            )
+                'data_broker_host': self.broker_host,
+                'data_broker_port': self.broker_port
+            }) ,qos=1)
+
             self.registered = True
             logger.info(f"Registered with coordinator: {len(self.topics)} topics")
             
@@ -80,7 +89,16 @@ class Subscriber:
     def migrate_to_broker(self, new_host: str, new_port: int):
         """Migrate to a new broker"""
         with self.migration_lock:
+            ack = {
+                "client_id": self.client_id,
+                "role": "subscriber",
+                "new_broker_host": new_host,
+                "new_broker_port": new_port,
+                "t": time.time()
+            }
+
             if new_host == self.broker_host and new_port == self.broker_port:
+                self.ctrl_client.publish("coordinator/ack", json.dumps(ack), qos=1)
                 logger.info("Already connected to target broker")
                 return
             
@@ -104,6 +122,9 @@ class Subscriber:
                 self.client.connect(new_host, new_port, 60)
                 self.client.loop_start()
                 logger.info(f"Successfully migrated to {new_host}:{new_port}")
+
+                # Send ACK when succeeded migration
+                self.ctrl_client.publish("coordinator/ack", json.dumps(ack), qos=1)
             except Exception as e:
                 logger.error(f"Failed to migrate: {e}")
     
@@ -150,9 +171,14 @@ class Subscriber:
     def connect(self):
         """Connect to MQTT broker"""
         try:
+            self.ctrl_client.connect(self.control_host, self.control_port, 60)
+            self.ctrl_client.loop_start()
+            time.sleep(0.5)
+
             self.client.connect(self.broker_host, self.broker_port, 60)
             self.client.loop_start()
-            time.sleep(2)  # Wait for connection
+            time.sleep(1)
+
             return True
         except Exception as e:
             logger.error(f"Failed to connect: {e}")
@@ -184,6 +210,9 @@ class Subscriber:
         self.client.loop_stop()
         self.client.disconnect()
 
+        self.ctrl_client.loop_stop()
+        self.ctrl_client.disconnect()
+
 
 class SubscriberManager:
     """Manages multiple subscribers"""
@@ -192,7 +221,6 @@ class SubscriberManager:
         self.num_subscribers = num_subscribers
         self.subscribers = []
         self.brokers = [
-            ("broker1", 1883),
             ("broker2", 1883),
             ("broker3", 1883),
             ("broker4", 1883),
@@ -224,14 +252,16 @@ class SubscriberManager:
             broker_host, broker_port = self.brokers[i % len(self.brokers)]
             
             subscriber = Subscriber(broker_host, broker_port, f"sub_{i}")
+
+            num_subscriptions = random.randint(1, min(5, len(self.topics)))
+            sub_topics = random.sample(self.topics, num_subscriptions)
+
+            subscriber.subscribe_to_topics(sub_topics)
             
             if subscriber.connect():
                 # Each subscriber subscribes to a random subset of topics
                 # to simulate varying subscription patterns
-                num_subscriptions = random.randint(1, min(5, len(self.topics)))
-                sub_topics = random.sample(self.topics, num_subscriptions)
-                
-                subscriber.subscribe_to_topics(sub_topics)
+
                 self.subscribers.append(subscriber)
                 
                 logger.info(f"Started subscriber {i} with {len(sub_topics)} subscriptions")
@@ -288,9 +318,9 @@ def main():
     logger.info("Starting Subscriber Manager...")
     
     # Wait for brokers and publishers to be ready
-    time.sleep(10)
+    time.sleep(5)
     
-    manager = SubscriberManager(num_subscribers=50)
+    manager = SubscriberManager(num_subscribers=20)
     manager.start()
     
     # Keep running

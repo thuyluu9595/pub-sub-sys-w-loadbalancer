@@ -17,6 +17,7 @@ from typing import Dict, List, Set
 from scipy.special import erf
 from scipy.spatial.distance import euclidean
 import logging
+import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -216,16 +217,21 @@ class LoadBalancer:
         logger.info(f"Allocating {len(sorted_topics)} hot topics to brokers")
         
         for topic in sorted_topics:
-            topic_rate = self.topic_stats[topic]['rate']
+            # topic_rate = self.topic_stats[topic]['rate']
+            topic_rate = self.topic_stats[topic]['rate'] * max(1, self.topic_stats[topic]['subscribers'])
             best_broker = None
             best_cost = float('inf')
             
             # Find available broker with best cost function
             for i, broker in enumerate(self.brokers):
                 # Check availability: R_i + R_k < μ_i
-                current_load = sum(self.topic_stats[t]['rate'] 
-                                 for t in broker.topics)
-                
+                # current_load = sum(self.topic_stats[t]['rate']
+                #                  for t in broker.topics)
+                current_load = sum(
+                    self.topic_stats[t]['rate'] * max(1, self.topic_stats[t]['subscribers'])
+                    for t in broker.topics
+                )
+
                 if current_load + topic_rate < broker.data_rate:
                     # Calculate new utilization if topic is assigned
                     new_util = (current_load + topic_rate) / broker.data_rate
@@ -284,14 +290,22 @@ class LoadBalancer:
         # Step 2: Calculate optimal utilization
         total_rate = sum(request_rates.values())
         optimal_utils = self.calculate_optimal_utilization(total_rate)
-        
+
+        # Reset per-cycle topic allocations to avoid accumulation
+        for b in self.brokers:
+            b.topics.clear()
+
         # Step 3: Run allocation algorithm
         allocation = self.allocation_matrix(hot_topics, optimal_utils)
         
         # Step 4: Update broker utilizations
         for i, broker in enumerate(self.brokers):
-            load = sum(self.topic_stats[t]['rate'] for t in broker.topics)
-            broker.utilization = load / broker.data_rate if broker.data_rate > 0 else 0
+            # load = sum(self.topic_stats[t]['rate'] for t in broker.topics
+            load = sum(
+                self.topic_stats[t]['rate'] * max(1, self.topic_stats[t]['subscribers'])
+                for t in broker.topics
+            )
+            broker.utilization = load / broker.data_rate if broker.data_rate > 0 else 0.0
             logger.info(f"Broker {i} utilization: {broker.utilization:.2%}")
         
         return allocation
@@ -311,14 +325,19 @@ class CoordinationService:
         
         # Central coordination broker for client registration
         self.coord_client = mqtt.Client("coordinator_main")
+        self.ctrl_host = os.getenv("CTRL_HOST", 'broker1')
+        self.ctrl_port = int(os.getenv("CTRL_PORT", '1883'))
         self.coord_client.on_connect = self._on_coord_connect
         self.coord_client.on_message = self._on_coord_message
         self._connect_coordination_broker()
+
+        self._last_ack_ts = {}  # cid -> monotonic() time of last ACK seen
+        self._cmd_sent_ts = {}  # cid -> monotonic() time of last migrate command sent
     
     def _init_brokers(self) -> List[BrokerInfo]:
         """Initialize broker information"""
         broker_configs = [
-            ("broker1", 1883, 350),
+            # ("broker1", 1883, 350),
             ("broker2", 1883, 450),
             ("broker3", 1883, 550),
             ("broker4", 1883, 600),
@@ -361,9 +380,9 @@ class CoordinationService:
     def _connect_coordination_broker(self):
         """Connect to broker1 for coordination messages"""
         try:
-            self.coord_client.connect("broker1", 1883, 60)
+            self.coord_client.connect(self.ctrl_host, self.ctrl_port, 60)
             self.coord_client.loop_start()
-            logger.info("Coordination client connected to broker1")
+            logger.info(f"Coordination client connected to control broker {self.ctrl_host}")
         except Exception as e:
             logger.error(f"Failed to connect coordination client: {e}")
     
@@ -373,6 +392,7 @@ class CoordinationService:
         # Subscribe to registration and statistics topics
         client.subscribe("coordinator/register/+")
         client.subscribe("coordinator/stats/+")
+        client.subscribe("coordinator/ack")
         logger.info("Subscribed to coordinator topics")
     
     def _on_coord_message(self, client, userdata, msg):
@@ -386,14 +406,15 @@ class CoordinationService:
                 client_id = payload['client_id']
                 client_type = payload['type']
                 topics = payload['topics']
-                broker_host = payload.get('broker_host')
-                
+                broker_host = payload.get('data_broker_host')
+                broker_port = payload.get('data_broker_port')
+
                 if client_type == 'publisher':
                     rates = payload.get('rates', {})
-                    self.register_publisher(client_id, topics, rates, broker_host)
+                    self.register_publisher(client_id, topics, rates, broker_host, broker_port)
                     logger.info(f"Registered publisher {client_id} with {len(topics)} topics")
                 elif client_type == 'subscriber':
-                    self.register_subscriber(client_id, topics, broker_host)
+                    self.register_subscriber(client_id, topics, broker_host, broker_port)
                     logger.info(f"Registered subscriber {client_id} with {len(topics)} topics")
             
             elif topic_parts[1] == 'stats':
@@ -406,10 +427,50 @@ class CoordinationService:
                 with self.lock:
                     current_subs = self.load_balancer.topic_stats[topic].get('subscribers', 0)
                     self.load_balancer.update_topic_stats(topic, rate, current_subs)
-                
+            elif topic_parts[1] == 'ack':
+                ack = json.loads(msg.payload.decode())
+                client_id = ack.get('client_id')
+                if not client_id:
+                    return
+
+                info = self.clients.get(client_id)
+                if info is not None:
+                    info['broker_host'] = ack.get('new_broker_host', info.get('broker_host'))
+                    if 'new_broker_port' in ack:
+                        try:
+                            info['broker_port'] = int(ack['new_broker_port'])
+                        except Exception:
+                            info['broker_port'] = ack['new_broker_port']
+
+                # mark that we saw an ACK now
+                self._last_ack_ts[client_id] = time.monotonic()
+
         except Exception as e:
             logger.error(f"Error processing coordination message: {e}")
-    
+
+    def _wait_for_acks(self, client_ids, timeout=10.0):
+        """Wait until each client in client_ids has ACKed AFTER its last command was sent,
+        or until timeout elapses. Returns list of missing cids (empty if all good)."""
+        deadline = time.monotonic() + timeout
+        pending = set(client_ids)
+
+        while pending and time.monotonic() < deadline:
+            done = []
+            for cid in list(pending):
+                sent_at = self._cmd_sent_ts.get(cid, 0.0)
+                ack_at = self._last_ack_ts.get(cid, 0.0)
+                if ack_at >= sent_at and sent_at > 0.0:
+                    done.append(cid)
+            for cid in done:
+                pending.discard(cid)
+            time.sleep(0.05)  # tiny poll interval
+
+        if pending:
+            logger.warning(f"Timed out waiting for ACKs from: {sorted(pending)}")
+        else:
+            logger.info("All ACKs received.")
+        return list(pending)
+
     def send_migration_command(self, client_id: str, new_broker_host: str, new_broker_port: int):
         """Send migration command to a client"""
         try:
@@ -419,7 +480,10 @@ class CoordinationService:
                 'broker_port': new_broker_port,
                 'timestamp': time.time()
             }
-            
+
+            # record when we told this client to move
+            self._cmd_sent_ts[client_id] = time.monotonic()
+
             self.coord_client.publish(
                 f"coordinator/migrate/{client_id}",
                 json.dumps(command),
@@ -430,20 +494,20 @@ class CoordinationService:
         except Exception as e:
             logger.error(f"Failed to send migration command: {e}")
     
-    def register_publisher(self, client_id: str, topics: List[str], rates: Dict[str, float], broker_host: str):
+    def register_publisher(self, client_id: str, topics: List[str], rates: Dict[str, float], broker_host: str, broker_port: int):
         """Register a publisher with its topics and rates"""
         with self.lock:
-            self.clients[client_id] = {'type': 'publisher', 'topics': topics, 'broker_host': broker_host}
+            self.clients[client_id] = {'type': 'publisher', 'topics': topics, 'broker_host': broker_host, 'broker_port': broker_port}
             
             for topic in topics:
                 rate = rates.get(topic, 1.0)
                 self.load_balancer.update_topic_stats(topic, rate, 0)
                 self.load_balancer.trie.insert(topic)
     
-    def register_subscriber(self, client_id: str, topics: List[str], broker_host: str):
+    def register_subscriber(self, client_id: str, topics: List[str], broker_host: str, broker_port: int):
         """Register a subscriber with its topic subscriptions"""
         with self.lock:
-            self.clients[client_id] = {'type': 'subscriber', 'topics': topics, 'broker_host': broker_host}
+            self.clients[client_id] = {'type': 'subscriber', 'topics': topics, 'broker_host': broker_host, 'broker_port': broker_port}
             
             for topic in topics:
                 current_subs = self.load_balancer.topic_stats[topic]['subscribers']
@@ -456,7 +520,7 @@ class CoordinationService:
         time.sleep(10)
         
         while True:
-            time.sleep(3)  # Balance every 3 seconds
+            time.sleep(2)
             
             try:
                 with self.lock:
@@ -464,27 +528,25 @@ class CoordinationService:
                     
                     if allocation:
                         logger.info(f"Load balancing complete. Allocation: {allocation}")
-                        
-                        # Migrate clients based on new allocation
+
                         for topic, broker_idx in allocation.items():
-                            # Find clients using this topic
-                            for client_id, client_info in self.clients.items():
-                                if topic in client_info['topics']:
-                                    # Get target broker info
-                                    target_broker = self.brokers[broker_idx]
-                                    
-                                    # Check if client needs migration
-                                    current_broker_host = client_info.get('broker_host')
-                                    if current_broker_host != target_broker.host:
-                                        logger.info(f"Migrating {client_id} to {target_broker.host}")
-                                        self.send_migration_command(
-                                            client_id,
-                                            target_broker.host,
-                                            target_broker.port
-                                        )
-                                        # Update client's broker assignment
-                                        client_info['broker_host'] = target_broker.host
-                                        client_info['broker_port'] = target_broker.port
+                            target = self.brokers[broker_idx]
+                            subs = [cid for cid, info in self.clients.items()
+                                    if info['type'] == 'subscriber' and topic in info['topics']
+                                    and info.get('broker_host') != target.host]
+                            pubs = [cid for cid, info in self.clients.items()
+                                    if info['type'] == 'publisher' and topic in info['topics']
+                                    and info.get('broker_host') != target.host]
+
+                            # (1) move subscribers, wait for ACKs
+                            for cid in subs:
+                                self.send_migration_command(cid, target.host, target.port)
+                            self._wait_for_acks(subs, timeout=8.0)
+
+                            # (2) then move publishers
+                            for cid in pubs:
+                                self.send_migration_command(cid, target.host, target.port)
+                            self._wait_for_acks(pubs, timeout=8.0)
                     
             except Exception as e:
                 logger.error(f"Error in balancing cycle: {e}")

@@ -11,6 +11,7 @@ import random
 import threading
 import logging
 from typing import Dict, List
+import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -32,15 +33,30 @@ class Publisher:
         self.publish_rates = {}  # topic -> messages per second
         self.migration_lock = threading.Lock()
         self.registered = False
-    
+
+        # Attributes for control broker
+        self.control_host = os.getenv("CONTROL_HOST", "broker1")
+        self.control_port = int(os.getenv("CONTROL_PORT", "1883"))
+        self.ctrl_client = mqtt.Client(f"{client_id}-ctrl")
+        self.ctrl_client.on_connect = self.on_ctrl_connect
+        self.ctrl_client.on_message = self.on_message
+        self.ctrl_client.on_publish = self.on_publish
+
+    def on_ctrl_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            logger.info("Connected to control broker")
+            client.subscribe(f"coordinator/migrate/{self.client_id}")
+
+            # Register with coordinator if not already registered
+            if not self.registered and self.topics:
+                self.register_with_coordinator()
+
+
     def on_connect(self, client, userdata, flags, rc):
         """Callback for when the client connects to the broker"""
         if rc == 0:
             logger.info(f"Publisher {self.client_id} connected to {self.broker_host}:{self.broker_port}")
-            
-            # Subscribe to migration commands
-            client.subscribe(f"coordinator/migrate/{self.client_id}")
-            
+
             # Register with coordinator if not already registered
             if not self.registered and self.topics:
                 self.register_with_coordinator()
@@ -56,6 +72,7 @@ class Publisher:
                 new_port = command['broker_port']
                 
                 logger.info(f"Received migration command: {new_host}:{new_port}")
+                time.sleep(0.2)
                 self.migrate_to_broker(new_host, new_port)
             except Exception as e:
                 logger.error(f"Error processing migration command: {e}")
@@ -63,24 +80,18 @@ class Publisher:
     def register_with_coordinator(self):
         """Register this publisher with the coordinator"""
         try:
-            registration = {
-                'client_id': self.client_id,
-                'type': 'publisher',
-                'topics': self.topics,
-                'rates': self.publish_rates,
-                'broker_host': self.broker_host
-            }
-            
-            self.client.publish(
-                "coordinator/register/publisher",
-                json.dumps(registration),
-                qos=1
-            )
+
+            self.ctrl_client.publish("coordinator/register/publisher", json.dumps({
+                "client_id": self.client_id,
+                "type": "publisher",
+                "topics": self.topics,
+                "rates": self.publish_rates,
+                "data_broker_host": self.broker_host,
+                "data_broker_port": self.broker_port
+            }), qos=1)
+
             self.registered = True
             logger.info(f"Registered with coordinator: {len(self.topics)} topics")
-            
-            # Start sending statistics
-            threading.Thread(target=self._send_statistics, daemon=True).start()
             
         except Exception as e:
             logger.error(f"Failed to register with coordinator: {e}")
@@ -92,24 +103,28 @@ class Publisher:
             
             for topic in self.topics:
                 try:
-                    stats = {
-                        'topic': topic,
-                        'rate': self.publish_rates.get(topic, 0.0),
-                        'publisher_id': self.client_id
-                    }
-                    
-                    self.client.publish(
-                        f"coordinator/stats/{topic}",
-                        json.dumps(stats),
-                        qos=0
-                    )
+                    self.ctrl_client.publish(f"coordinator/stats/{topic}", json.dumps({
+                        "topic": topic,
+                        "rate": self.publish_rates.get(topic, 0.0),
+                        "publisher_id": self.client_id
+                    }), qos=0)
+
                 except Exception as e:
                     logger.error(f"Failed to send statistics: {e}")
     
     def migrate_to_broker(self, new_host: str, new_port: int):
         """Migrate to a new broker"""
-        with self.migration_lock:
+        with (self.migration_lock):
+            ack = {
+                "client_id": self.client_id,
+                "role": "publisher",
+                "new_broker_host": new_host,
+                "new_broker_port": new_port,
+                "t": time.time()
+            }
             if new_host == self.broker_host and new_port == self.broker_port:
+                # send ACK anyway so coordinator considers this client "migrated"
+                self.ctrl_client.publish("coordinator/ack", json.dumps(ack), qos=1)
                 logger.info("Already connected to target broker")
                 return
             
@@ -134,8 +149,12 @@ class Publisher:
                 self.client.connect(new_host, new_port, 60)
                 self.client.loop_start()
                 logger.info(f"Successfully migrated to {new_host}:{new_port}")
+
+                # Send ACK when succeeded migration
+                self.ctrl_client.publish("coordinator/ack", json.dumps(ack), qos=1)
             except Exception as e:
                 logger.error(f"Failed to migrate: {e}")
+
     
     def on_publish(self, client, userdata, mid):
         """Callback for when a message is published"""
@@ -144,9 +163,16 @@ class Publisher:
     def connect(self):
         """Connect to MQTT broker"""
         try:
+            # Connect to control broker
+            self.ctrl_client.connect(self.control_host, self.control_port, 60)
+            self.ctrl_client.loop_start()
+            time.sleep(0.5)  # Wait for connection
+
+            # Connect to data broker
             self.client.connect(self.broker_host, self.broker_port, 60)
             self.client.loop_start()
-            time.sleep(2)  # Wait for connection
+            time.sleep(1)  # Wait for connection
+
             return True
         except Exception as e:
             logger.error(f"Failed to connect: {e}")
@@ -171,6 +197,10 @@ class Publisher:
     def start_publishing(self):
         """Start publishing messages on all topics"""
         self.running = True
+
+        # Start sending statistics
+        threading.Thread(target=self._send_statistics, daemon=True).start()
+
         threads = []
         
         for topic in self.topics:
@@ -218,6 +248,9 @@ class Publisher:
         self.client.loop_stop()
         self.client.disconnect()
 
+        self.ctrl_client.loop_stop()
+        self.ctrl_client.disconnect()
+
 
 class PublisherManager:
     """Manages multiple publishers"""
@@ -227,7 +260,6 @@ class PublisherManager:
         self.publishers = []
         self.topics = self._generate_topics()
         self.brokers = [
-            ("broker1", 1883),
             ("broker2", 1883),
             ("broker3", 1883),
             ("broker4", 1883),
@@ -288,10 +320,11 @@ class PublisherManager:
             pub_topics = self.topics[start_idx:end_idx]
             
             publisher = Publisher(broker_host, broker_port, f"pub_{i}")
+
+            pub_rates = {t: rates[t] for t in pub_topics}
+            publisher.set_topics(pub_topics, pub_rates)
             
             if publisher.connect():
-                pub_rates = {t: rates[t] for t in pub_topics}
-                publisher.set_topics(pub_topics, pub_rates)
                 publisher.start_publishing()
                 self.publishers.append(publisher)
                 
