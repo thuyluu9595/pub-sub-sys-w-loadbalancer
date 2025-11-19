@@ -311,18 +311,114 @@ class LoadBalancer:
         return allocation
 
 
+class OverheadMonitor:
+    """
+    Tracks control-plane overhead in bytes/messages by category and per topic.
+    Categories we track:
+      - IN:  'register_in', 'stats_in', 'ack_in', 'other_in'
+      - OUT: 'migrate_out', 'other_out'
+    Per-topic we attribute:
+      - stats_in (incoming stats)
+      - migrate_out (outgoing migration cmds), if caller provides ctx_topic
+    """
+    def __init__(self, window_s: float = 10.0):
+        self.window_s = max(1.0, float(window_s))
+        self.lock = threading.Lock()
+        self._reset_all()
+
+    def _reset_all(self):
+        self.cum_in = {"bytes": 0, "msgs": 0}
+        self.cum_out = {"bytes": 0, "msgs": 0}
+        self.cum_by_cat_in = defaultdict(lambda: {"bytes": 0, "msgs": 0})
+        self.cum_by_cat_out = defaultdict(lambda: {"bytes": 0, "msgs": 0})
+        self.cum_per_topic = defaultdict(lambda: {
+            "stats_in_bytes": 0, "stats_in_msgs": 0,
+            "migrate_out_bytes": 0, "migrate_out_msgs": 0
+        })
+
+        self.win_start = time.time()
+        self.win_in = {"bytes": 0, "msgs": 0}
+        self.win_out = {"bytes": 0, "msgs": 0}
+        self.win_by_cat_in = defaultdict(lambda: {"bytes": 0, "msgs": 0})
+        self.win_by_cat_out = defaultdict(lambda: {"bytes": 0, "msgs": 0})
+        self.win_per_topic = defaultdict(lambda: {
+            "stats_in_bytes": 0, "stats_in_msgs": 0,
+            "migrate_out_bytes": 0, "migrate_out_msgs": 0
+        })
+
+    def _add(self, bucket: dict, key: str, byte_count: int, msgs: int = 1):
+        e = bucket[key]
+        e["bytes"] += int(byte_count)
+        e["msgs"] += int(msgs)
+
+    def record_in(self, category: str, topic_str: str, payload_len: int, *, per_topic: str | None = None):
+        """Count incoming message. We include topic bytes + payload bytes."""
+        byte_count = int(payload_len) + len(topic_str or "")
+        with self.lock:
+            self.cum_in["bytes"] += byte_count; self.cum_in["msgs"] += 1
+            self.win_in["bytes"] += byte_count; self.win_in["msgs"] += 1
+            self._add(self.cum_by_cat_in, category, byte_count)
+            self._add(self.win_by_cat_in, category, byte_count)
+            if per_topic and category == "stats_in":
+                t = self.cum_per_topic[per_topic]; t["stats_in_bytes"] += byte_count; t["stats_in_msgs"] += 1
+                w = self.win_per_topic[per_topic]; w["stats_in_bytes"] += byte_count; w["stats_in_msgs"] += 1
+
+    def record_out(self, category: str, topic_str: str, payload_len: int, *, per_topic: str | None = None):
+        """Count outgoing message. We include topic bytes + payload bytes."""
+        # Note: caller should avoid counting internal metrics publications to prevent feedback.
+        byte_count = int(payload_len) + len(topic_str or "")
+        with self.lock:
+            self.cum_out["bytes"] += byte_count; self.cum_out["msgs"] += 1
+            self.win_out["bytes"] += byte_count; self.win_out["msgs"] += 1
+            self._add(self.cum_by_cat_out, category, byte_count)
+            self._add(self.win_by_cat_out, category, byte_count)
+            if per_topic and category == "migrate_out":
+                t = self.cum_per_topic[per_topic]; t["migrate_out_bytes"] += byte_count; t["migrate_out_msgs"] += 1
+                w = self.win_per_topic[per_topic]; w["migrate_out_bytes"] += byte_count; w["migrate_out_msgs"] += 1
+
+    def snapshot_and_reset_window(self) -> dict:
+        """Return a snapshot for the last window and reset window counters."""
+        with self.lock:
+            now = time.time()
+            elapsed = max(1e-6, now - self.win_start)
+            snap = {
+                "window_seconds": elapsed,
+                "inbound": dict(self.win_in),
+                "outbound": dict(self.win_out),
+                "by_category_in": {k: dict(v) for k, v in self.win_by_cat_in.items()},
+                "by_category_out": {k: dict(v) for k, v in self.win_by_cat_out.items()},
+                "per_topic": {k: dict(v) for k, v in self.win_per_topic.items()},
+                "cumulative": {
+                    "inbound": dict(self.cum_in),
+                    "outbound": dict(self.cum_out),
+                }
+            }
+            # reset window
+            self.win_start = now
+            self.win_in = {"bytes": 0, "msgs": 0}
+            self.win_out = {"bytes": 0, "msgs": 0}
+            self.win_by_cat_in = defaultdict(lambda: {"bytes": 0, "msgs": 0})
+            self.win_by_cat_out = defaultdict(lambda: {"bytes": 0, "msgs": 0})
+            self.win_per_topic = defaultdict(lambda: {
+                "stats_in_bytes": 0, "stats_in_msgs": 0,
+                "migrate_out_bytes": 0, "migrate_out_msgs": 0
+            })
+            return snap
+
+
 class CoordinationService:
     """Main coordination service"""
+
     def __init__(self):
         self.brokers = self._init_brokers()
         self.load_balancer = LoadBalancer(self.brokers)
         self.clients = {}
         self.lock = threading.Lock()
-        
+
         # MQTT clients for each broker
         self.broker_clients = {}
         self._connect_to_brokers()
-        
+
         # Central coordination broker for client registration
         self.coord_client = mqtt.Client("coordinator_main")
         self.ctrl_host = os.getenv("CTRL_HOST", 'broker1')
@@ -333,7 +429,46 @@ class CoordinationService:
 
         self._last_ack_ts = {}  # cid -> monotonic() time of last ACK seen
         self._cmd_sent_ts = {}  # cid -> monotonic() time of last migrate command sent
-    
+
+        # --- Overhead monitor ---
+        window_s = float(os.getenv("OVERHEAD_WINDOW_S", "10"))
+        self._publish_metrics = os.getenv("OVERHEAD_PUBLISH", "1") == "1"
+        self.overhead = OverheadMonitor(window_s=window_s)
+        # Start reporter thread
+        self._oh_thread = threading.Thread(target=self._overhead_reporter, daemon=True)
+        self._oh_thread.start()
+
+    def _overhead_reporter(self):
+        """Periodically log and (optionally) publish control-plane overhead snapshots."""
+        topic_metrics = "coordinator/metrics/overhead"
+        while True:
+            time.sleep(self.overhead.window_s)
+            snap = self.overhead.snapshot_and_reset_window()
+
+            # Pretty log
+            in_b = snap["inbound"]["bytes"];
+            out_b = snap["outbound"]["bytes"]
+            in_m = snap["inbound"]["msgs"];
+            out_m = snap["outbound"]["msgs"]
+            win = snap["window_seconds"]
+            in_rate = in_b / win if win > 0 else 0.0
+            out_rate = out_b / win if win > 0 else 0.0
+
+            logger.info(
+                "[OVERHEAD] window=%.2fs  IN: %d bytes (%d msgs, %.1f B/s)  "
+                "OUT: %d bytes (%d msgs, %.1f B/s)  cats_in=%s  cats_out=%s",
+                win, in_b, in_m, in_rate, out_b, out_m, out_rate,
+                {k: v["bytes"] for k, v in snap["by_category_in"].items()},
+                {k: v["bytes"] for k, v in snap["by_category_out"].items()},
+            )
+
+            # Optionally publish a JSON snapshot (excluded from overhead counting)
+            if self._publish_metrics:
+                try:
+                    self.coord_client.publish(topic_metrics, json.dumps(snap), qos=0)
+                except Exception as e:
+                    logger.warning(f"Failed to publish overhead metrics: {e}")
+
     def _init_brokers(self) -> List[BrokerInfo]:
         """Initialize broker information"""
         broker_configs = [
@@ -394,14 +529,20 @@ class CoordinationService:
         client.subscribe("coordinator/stats/+")
         client.subscribe("coordinator/ack")
         logger.info("Subscribed to coordinator topics")
-    
+
     def _on_coord_message(self, client, userdata, msg):
-        """Handle coordination messages from clients"""
+        """Handle coordination messages from clients + record control-plane overhead."""
         try:
             topic_parts = msg.topic.split('/')
-            
+
+            # Do not count metrics we publish ourselves (avoid feedback loops)
+            if msg.topic.startswith("coordinator/metrics/"):
+                return
+
             if topic_parts[1] == 'register':
-                # Client registration: coordinator/register/{publisher|subscriber}
+                # INCOMING control-plane: registration
+                self.overhead.record_in('register_in', msg.topic, len(msg.payload))
+
                 payload = json.loads(msg.payload.decode())
                 client_id = payload['client_id']
                 client_type = payload['type']
@@ -416,18 +557,23 @@ class CoordinationService:
                 elif client_type == 'subscriber':
                     self.register_subscriber(client_id, topics, broker_host, broker_port)
                     logger.info(f"Registered subscriber {client_id} with {len(topics)} topics")
-            
+
             elif topic_parts[1] == 'stats':
-                # Topic statistics: coordinator/stats/{topic}
+                # INCOMING control-plane: stats (attribute per-topic)
+                self.overhead.record_in('stats_in', msg.topic, len(msg.payload),
+                                        per_topic=topic_parts[2] if len(topic_parts) > 2 else None)
+
                 payload = json.loads(msg.payload.decode())
                 topic = payload['topic']
                 rate = payload.get('rate', 0.0)
-                # num_subs = payload.get('subscribers', 0)
-                
                 with self.lock:
                     current_subs = self.load_balancer.topic_stats[topic].get('subscribers', 0)
                     self.load_balancer.update_topic_stats(topic, rate, current_subs)
+
             elif topic_parts[1] == 'ack':
+                # INCOMING control-plane: ack
+                self.overhead.record_in('ack_in', msg.topic, len(msg.payload))
+
                 ack = json.loads(msg.payload.decode())
                 client_id = ack.get('client_id')
                 if not client_id:
@@ -444,6 +590,10 @@ class CoordinationService:
 
                 # mark that we saw an ACK now
                 self._last_ack_ts[client_id] = time.monotonic()
+
+            else:
+                # INCOMING control-plane: other
+                self.overhead.record_in('other_in', msg.topic, len(msg.payload))
 
         except Exception as e:
             logger.error(f"Error processing coordination message: {e}")
@@ -471,8 +621,40 @@ class CoordinationService:
             logger.info("All ACKs received.")
         return list(pending)
 
-    def send_migration_command(self, client_id: str, new_broker_host: str, new_broker_port: int):
-        """Send migration command to a client"""
+    def _overhead_reporter(self):
+        """Periodically log and (optionally) publish control-plane overhead snapshots."""
+        topic_metrics = "coordinator/metrics/overhead"
+        while True:
+            time.sleep(self.overhead.window_s)
+            snap = self.overhead.snapshot_and_reset_window()
+
+            # Pretty log
+            in_b = snap["inbound"]["bytes"];
+            out_b = snap["outbound"]["bytes"]
+            in_m = snap["inbound"]["msgs"];
+            out_m = snap["outbound"]["msgs"]
+            win = snap["window_seconds"]
+            in_rate = in_b / win if win > 0 else 0.0
+            out_rate = out_b / win if win > 0 else 0.0
+
+            logger.info(
+                "[OVERHEAD] window=%.2fs  IN: %d bytes (%d msgs, %.1f B/s)  "
+                "OUT: %d bytes (%d msgs, %.1f B/s)  cats_in=%s  cats_out=%s",
+                win, in_b, in_m, in_rate, out_b, out_m, out_rate,
+                {k: v["bytes"] for k, v in snap["by_category_in"].items()},
+                {k: v["bytes"] for k, v in snap["by_category_out"].items()},
+            )
+
+            # Optionally publish a JSON snapshot (excluded from overhead counting)
+            if self._publish_metrics:
+                try:
+                    self.coord_client.publish(topic_metrics, json.dumps(snap), qos=0)
+                except Exception as e:
+                    logger.warning(f"Failed to publish overhead metrics: {e}")
+
+    def send_migration_command(self, client_id: str, new_broker_host: str, new_broker_port: int,
+                               ctx_topic: str | None = None):
+        """Send migration command to a client and record OUT overhead (attribute to ctx_topic if provided)."""
         try:
             command = {
                 'client_id': client_id,
@@ -484,16 +666,18 @@ class CoordinationService:
             # record when we told this client to move
             self._cmd_sent_ts[client_id] = time.monotonic()
 
-            self.coord_client.publish(
-                f"coordinator/migrate/{client_id}",
-                json.dumps(command),
-                qos=1
-            )
+            topic = f"coordinator/migrate/{client_id}"
+            payload = json.dumps(command)
+
+            # OUTGOING control-plane: migration
+            self.overhead.record_out('migrate_out', topic, len(payload), per_topic=ctx_topic)
+
+            self.coord_client.publish(topic, payload, qos=1)
             logger.info(f"Sent migration command to {client_id}: {new_broker_host}:{new_broker_port}")
-            
+
         except Exception as e:
             logger.error(f"Failed to send migration command: {e}")
-    
+
     def register_publisher(self, client_id: str, topics: List[str], rates: Dict[str, float], broker_host: str, broker_port: int):
         """Register a publisher with its topics and rates"""
         with self.lock:
@@ -513,19 +697,19 @@ class CoordinationService:
                 current_subs = self.load_balancer.topic_stats[topic]['subscribers']
                 self.load_balancer.topic_stats[topic]['subscribers'] = current_subs + 1
                 self.load_balancer.trie.insert(topic, client_id)
-    
+
     def run_balancing_cycle(self):
         """Run load balancing cycle periodically"""
         # Wait for initial registrations
         time.sleep(10)
-        
+
         while True:
             time.sleep(2)
-            
+
             try:
                 with self.lock:
                     allocation = self.load_balancer.detect_and_balance()
-                    
+
                     if allocation:
                         logger.info(f"Load balancing complete. Allocation: {allocation}")
 
@@ -540,14 +724,14 @@ class CoordinationService:
 
                             # (1) move subscribers, wait for ACKs
                             for cid in subs:
-                                self.send_migration_command(cid, target.host, target.port)
+                                self.send_migration_command(cid, target.host, target.port, ctx_topic=topic)
                             self._wait_for_acks(subs, timeout=8.0)
 
                             # (2) then move publishers
                             for cid in pubs:
-                                self.send_migration_command(cid, target.host, target.port)
+                                self.send_migration_command(cid, target.host, target.port, ctx_topic=topic)
                             self._wait_for_acks(pubs, timeout=8.0)
-                    
+
             except Exception as e:
                 logger.error(f"Error in balancing cycle: {e}")
                 import traceback

@@ -73,8 +73,10 @@ services:
       - BROKERS=broker1:1883,broker2:1883,broker3:1883,broker4:1883
       - BROKER_CAPACITIES=350,450,550,600
       - LOOP_THRESHOLD=0.8
-      - CONTROL_HOST=broker1
-      - CONTROL_PORT=1883
+      - CTRL_HOST=broker1
+      - CTRL_PORT=1883
+      - OVERHEAD_WINDOW_S=10
+      - OVERHEAD_PUBLISH=1
     volumes:
       - ./coordinator:/app
     networks:
