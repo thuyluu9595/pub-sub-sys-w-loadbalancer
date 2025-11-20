@@ -58,7 +58,7 @@ services:
       mqtt_network:
         ipv4_address: 172.20.0.14
 
-  # Coordination Service - Load Balancer with Hot Topic Detection
+  # Enhanced Coordination Service with Overhead Tracking
   coordinator:
     build:
       context: ./coordinator
@@ -77,6 +77,7 @@ services:
       - CONTROL_PORT=1883
     volumes:
       - ./coordinator:/app
+      - overhead-data:/app/data  # Shared volume for overhead data
     networks:
       - mqtt_network
 
@@ -124,3 +125,6 @@ networks:
     ipam:
       config:
         - subnet: 172.20.0.0/16
+
+volumes:
+  overhead-data:  # Shared volume for overhead tracking data

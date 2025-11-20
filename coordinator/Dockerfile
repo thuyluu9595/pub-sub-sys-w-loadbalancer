@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir \
     numpy==1.24.3 \
     scipy==1.10.1
 
-COPY coordinator.py .
+# Copy all Python files
+COPY *.py .
 
 CMD ["python", "-u", "coordinator.py"]
