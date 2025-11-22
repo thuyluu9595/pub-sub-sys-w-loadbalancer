@@ -227,7 +227,7 @@ class Publisher:
                 'topic': topic,
                 'message_id': msg_count,
                 'timestamp': time.time(),
-                'data': self._generate_payload(500, 600)  # 500-600 KB as per paper
+                'data': self._generate_payload(50, 100)
             }
             
             if self.publish_message(topic, payload):

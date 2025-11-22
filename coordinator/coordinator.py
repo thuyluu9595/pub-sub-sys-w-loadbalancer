@@ -28,8 +28,8 @@ class BrokerInfo:
     """Information about a broker"""
     host: str
     port: int
-    capacity_mbps: float  # Network capacity in Mbps
-    data_rate: float  # d_i: Data transmission rate
+    capacity_mbps: float
+    data_rate: float
     utilization: float = 0.0
     topics: Set[str] = None
     
@@ -130,10 +130,9 @@ class HotTopicDetector:
         
         return plof_scores
     
-    def compute_loop(self, request_rates: Dict[str, float], threshold: float = 0.8) -> Set[str]:
+    def compute_loop(self, request_rates: Dict[str, float], threshold: float = 0.4) -> Set[str]:
         """
         Compute Local Outlier Probability (LoOP)
-        Equations (2) and (3) from the paper
         Returns set of hot topics
         """
         plof_scores = self.compute_plof(request_rates)
@@ -198,7 +197,6 @@ class LoadBalancer:
     def calculate_cost_function(self, broker_idx: int, current_util: float, optimal_util: float) -> float:
         """
         Calculate cost function ν_i
-        Equation (17) from the paper
         """
         return abs(optimal_util - current_util)
     
@@ -224,9 +222,6 @@ class LoadBalancer:
             
             # Find available broker with best cost function
             for i, broker in enumerate(self.brokers):
-                # Check availability: R_i + R_k < μ_i
-                # current_load = sum(self.topic_stats[t]['rate']
-                #                  for t in broker.topics)
                 current_load = sum(
                     self.topic_stats[t]['rate'] * max(1, self.topic_stats[t]['subscribers'])
                     for t in broker.topics
@@ -263,10 +258,6 @@ class LoadBalancer:
     
     def detect_and_balance(self):
         """Main load balancing routine"""
-        # Get all topics with their request rates
-        # request_rates = {topic: stats['rate']
-        #                 for topic, stats in self.topic_stats.items()}
-
         # Get all topics with their request rates
         request_rates = {}
         for topic, stats in self.topic_stats.items():
@@ -526,7 +517,7 @@ class CoordinationService:
         logger.info(f"Coordinator connected with result code {rc}")
         # Subscribe to registration and statistics topics
         client.subscribe("coordinator/register/+")
-        client.subscribe("coordinator/stats/+")
+        client.subscribe("coordinator/stats/#")
         client.subscribe("coordinator/ack")
         logger.info("Subscribed to coordinator topics")
 
@@ -560,11 +551,14 @@ class CoordinationService:
 
             elif topic_parts[1] == 'stats':
                 # INCOMING control-plane: stats (attribute per-topic)
-                self.overhead.record_in('stats_in', msg.topic, len(msg.payload),
-                                        per_topic=topic_parts[2] if len(topic_parts) > 2 else None)
+                # self.overhead.record_in('stats_in', msg.topic, len(msg.payload),
+                #                         per_topic=topic_parts[2] if len(topic_parts) > 2 else None)
+                full_topic = "/".join(topic_parts[2:]) if len(topic_parts) > 2 else None
+                self.overhead.record_in('stats_in', msg.topic, len(msg.payload), per_topic = full_topic)
 
                 payload = json.loads(msg.payload.decode())
-                topic = payload['topic']
+                # topic = payload['topic']
+                topic = payload.get('topic', full_topic)
                 rate = payload.get('rate', 0.0)
                 with self.lock:
                     current_subs = self.load_balancer.topic_stats[topic].get('subscribers', 0)
@@ -629,9 +623,9 @@ class CoordinationService:
             snap = self.overhead.snapshot_and_reset_window()
 
             # Pretty log
-            in_b = snap["inbound"]["bytes"];
+            in_b = snap["inbound"]["bytes"]
             out_b = snap["outbound"]["bytes"]
-            in_m = snap["inbound"]["msgs"];
+            in_m = snap["inbound"]["msgs"]
             out_m = snap["outbound"]["msgs"]
             win = snap["window_seconds"]
             in_rate = in_b / win if win > 0 else 0.0
