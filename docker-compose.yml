@@ -75,8 +75,9 @@ services:
       - LOOP_THRESHOLD=0.8
       - CTRL_HOST=broker1
       - CTRL_PORT=1883
-      - OVERHEAD_WINDOW_S=10
+      - OVERHEAD_WINDOW_S=5
       - OVERHEAD_PUBLISH=1
+      - OVERHEAD_CSV_PATH=/app/overhead_metrics.csv
     volumes:
       - ./coordinator:/app
     networks:

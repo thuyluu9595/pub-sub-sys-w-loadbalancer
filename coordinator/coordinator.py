@@ -18,6 +18,7 @@ from scipy.special import erf
 from scipy.spatial.distance import euclidean
 import logging
 import os
+import csv
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -422,9 +423,23 @@ class CoordinationService:
         self._cmd_sent_ts = {}  # cid -> monotonic() time of last migrate command sent
 
         # --- Overhead monitor ---
-        window_s = float(os.getenv("OVERHEAD_WINDOW_S", "10"))
+        window_s = float(os.getenv("OVERHEAD_WINDOW_S", "5"))
         self._publish_metrics = os.getenv("OVERHEAD_PUBLISH", "1") == "1"
         self.overhead = OverheadMonitor(window_s=window_s)
+
+        # CSV config
+        self._csv_path = os.getenv("OVERHEAD_CSV_PATH", "/app/overhead_metrics.csv")
+        # fixed schema so you can analyze easily later
+        self._csv_fields = [
+            "ts_iso", "window_seconds",
+            "in_bytes", "in_msgs", "out_bytes", "out_msgs",
+            "register_in_bytes", "stats_in_bytes", "ack_in_bytes", "other_in_bytes",
+            "migrate_out_bytes", "other_out_bytes",
+            # paper-style buckets for convenience:
+            "init_bytes", "mapping_bytes", "reassignment_bytes"
+        ]
+        self._ensure_csv_header()
+
         # Start reporter thread
         self._oh_thread = threading.Thread(target=self._overhead_reporter, daemon=True)
         self._oh_thread.start()
@@ -551,13 +566,10 @@ class CoordinationService:
 
             elif topic_parts[1] == 'stats':
                 # INCOMING control-plane: stats (attribute per-topic)
-                # self.overhead.record_in('stats_in', msg.topic, len(msg.payload),
-                #                         per_topic=topic_parts[2] if len(topic_parts) > 2 else None)
                 full_topic = "/".join(topic_parts[2:]) if len(topic_parts) > 2 else None
                 self.overhead.record_in('stats_in', msg.topic, len(msg.payload), per_topic = full_topic)
 
                 payload = json.loads(msg.payload.decode())
-                # topic = payload['topic']
                 topic = payload.get('topic', full_topic)
                 rate = payload.get('rate', 0.0)
                 with self.lock:
@@ -615,36 +627,118 @@ class CoordinationService:
             logger.info("All ACKs received.")
         return list(pending)
 
+    def _ensure_csv_header(self):
+        """Create CSV file with header if it doesn't exist or is empty."""
+        try:
+            need_header = True
+            if os.path.exists(self._csv_path):
+                need_header = os.path.getsize(self._csv_path) == 0
+            else:
+                # ensure directory exists
+                os.makedirs(os.path.dirname(self._csv_path), exist_ok=True)
+
+            if need_header:
+                with open(self._csv_path, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(self._csv_fields)
+                logger.info(f"Created overhead CSV with header at {self._csv_path}")
+        except Exception as e:
+            logger.warning(f"Could not prepare CSV header at {self._csv_path}: {e}")
+
+    # def _overhead_reporter(self):
+    #     """Periodically log and (optionally) publish control-plane overhead snapshots."""
+    #     topic_metrics = "coordinator/metrics/overhead"
+    #     while True:
+    #         time.sleep(self.overhead.window_s)
+    #         snap = self.overhead.snapshot_and_reset_window()
+    #
+    #         # Pretty log
+    #         in_b = snap["inbound"]["bytes"]
+    #         out_b = snap["outbound"]["bytes"]
+    #         in_m = snap["inbound"]["msgs"]
+    #         out_m = snap["outbound"]["msgs"]
+    #         win = snap["window_seconds"]
+    #         in_rate = in_b / win if win > 0 else 0.0
+    #         out_rate = out_b / win if win > 0 else 0.0
+    #
+    #         logger.info(
+    #             "[OVERHEAD] window=%.2fs  IN: %d bytes (%d msgs, %.1f B/s)  "
+    #             "OUT: %d bytes (%d msgs, %.1f B/s)  cats_in=%s  cats_out=%s",
+    #             win, in_b, in_m, in_rate, out_b, out_m, out_rate,
+    #             {k: v["bytes"] for k, v in snap["by_category_in"].items()},
+    #             {k: v["bytes"] for k, v in snap["by_category_out"].items()},
+    #         )
+    #
+    #         # Optionally publish a JSON snapshot (excluded from overhead counting)
+    #         if self._publish_metrics:
+    #             try:
+    #                 self.coord_client.publish(topic_metrics, json.dumps(snap), qos=0)
+    #             except Exception as e:
+    #                 logger.warning(f"Failed to publish overhead metrics: {e}")
     def _overhead_reporter(self):
-        """Periodically log and (optionally) publish control-plane overhead snapshots."""
+        """Every window (default 5s), log + append one CSV row with overhead metrics."""
         topic_metrics = "coordinator/metrics/overhead"
         while True:
             time.sleep(self.overhead.window_s)
             snap = self.overhead.snapshot_and_reset_window()
 
-            # Pretty log
-            in_b = snap["inbound"]["bytes"]
+            # Basic aggregates
+            in_b = snap["inbound"]["bytes"];
             out_b = snap["outbound"]["bytes"]
-            in_m = snap["inbound"]["msgs"]
+            in_m = snap["inbound"]["msgs"];
             out_m = snap["outbound"]["msgs"]
             win = snap["window_seconds"]
-            in_rate = in_b / win if win > 0 else 0.0
-            out_rate = out_b / win if win > 0 else 0.0
+            cats_in = snap["by_category_in"]
+            cats_out = snap["by_category_out"]
 
+            # Category bytes (missing => 0)
+            def bcat(d, k):
+                return d.get(k, {"bytes": 0})["bytes"]
+
+            reg_b = bcat(cats_in, "register_in")
+            sts_b = bcat(cats_in, "stats_in")
+            ack_b = bcat(cats_in, "ack_in")
+            oth_in = bcat(cats_in, "other_in")
+            mig_b = bcat(cats_out, "migrate_out")
+            oth_out = bcat(cats_out, "other_out")
+
+            # Paper buckets (derived):
+            init_bytes = reg_b  # you can add first-window stats if you want
+            mapping_bytes = mig_b + ack_b
+            reassignment_bytes = mapping_bytes  # in this implementation, reassignment is migrate+ack
+
+            # Log summary
             logger.info(
-                "[OVERHEAD] window=%.2fs  IN: %d bytes (%d msgs, %.1f B/s)  "
-                "OUT: %d bytes (%d msgs, %.1f B/s)  cats_in=%s  cats_out=%s",
-                win, in_b, in_m, in_rate, out_b, out_m, out_rate,
-                {k: v["bytes"] for k, v in snap["by_category_in"].items()},
-                {k: v["bytes"] for k, v in snap["by_category_out"].items()},
+                "[OVERHEAD] window=%.2fs  IN: %d bytes (%d msgs)  OUT: %d bytes (%d msgs) "
+                "cats_in=%s  cats_out=%s",
+                win, in_b, in_m, out_b, out_m,
+                {k: v['bytes'] for k, v in cats_in.items()},
+                {k: v['bytes'] for k, v in cats_out.items()},
             )
+            logger.info("[OVERHEAD.breakdown] init=%dB map=%dB reassign=%dB",
+                        init_bytes, mapping_bytes, reassignment_bytes)
 
-            # Optionally publish a JSON snapshot (excluded from overhead counting)
+            # Optional JSON publish (not counted by the monitor)
             if self._publish_metrics:
                 try:
                     self.coord_client.publish(topic_metrics, json.dumps(snap), qos=0)
                 except Exception as e:
                     logger.warning(f"Failed to publish overhead metrics: {e}")
+
+            # Append one CSV row
+            try:
+                with open(self._csv_path, "a", newline="") as f:
+                    w = csv.writer(f)
+                    w.writerow([
+                        time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),  # ts_iso (UTC)
+                        f"{win:.2f}",
+                        in_b, in_m, out_b, out_m,
+                        reg_b, sts_b, ack_b, oth_in,
+                        mig_b, oth_out,
+                        init_bytes, mapping_bytes, reassignment_bytes
+                    ])
+            except Exception as e:
+                logger.warning(f"Failed to write CSV row to {self._csv_path}: {e}")
 
     def send_migration_command(self, client_id: str, new_broker_host: str, new_broker_port: int,
                                ctx_topic: str | None = None):
