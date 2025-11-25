@@ -71,8 +71,7 @@ services:
       - broker4
     environment:
       - BROKERS=broker1:1883,broker2:1883,broker3:1883,broker4:1883
-      - BROKER_CAPACITIES=350,450,550,600
-      - LOOP_THRESHOLD=0.8
+      - BROKER_CAPACITIES=350,550,550,600
       - CTRL_HOST=broker1
       - CTRL_PORT=1883
       - OVERHEAD_WINDOW_S=5
@@ -116,6 +115,12 @@ services:
       - NUM_SUBSCRIBERS=20
       - CONTROL_HOST=broker1
       - CONTROL_PORT=1883
+      - PLAN_FILE=/app/plan.csv
+      - PLAN_FORMAT=csv
+      - SUBSCRIBE_MODE=all         # all or targeted
+      - HOT_RATE_THRESHOLD=0.4
+      - MIN_SUBS_PER_HOT=1
+      - MAX_TOPICS_PER_SUB=2
     volumes:
       - ./subscriber:/app
     networks:

@@ -298,7 +298,7 @@ class LoadBalancer:
                 for t in broker.topics
             )
             broker.utilization = load / broker.data_rate if broker.data_rate > 0 else 0.0
-            logger.info(f"Broker {i} utilization: {broker.utilization:.2%}")
+            logger.info(f"Broker {broker.host} utilization: {broker.utilization:.2%}")
         
         return allocation
 
@@ -619,7 +619,7 @@ class CoordinationService:
                     done.append(cid)
             for cid in done:
                 pending.discard(cid)
-            time.sleep(0.05)  # tiny poll interval
+            time.sleep(0.05)
 
         if pending:
             logger.warning(f"Timed out waiting for ACKs from: {sorted(pending)}")
@@ -645,36 +645,6 @@ class CoordinationService:
         except Exception as e:
             logger.warning(f"Could not prepare CSV header at {self._csv_path}: {e}")
 
-    # def _overhead_reporter(self):
-    #     """Periodically log and (optionally) publish control-plane overhead snapshots."""
-    #     topic_metrics = "coordinator/metrics/overhead"
-    #     while True:
-    #         time.sleep(self.overhead.window_s)
-    #         snap = self.overhead.snapshot_and_reset_window()
-    #
-    #         # Pretty log
-    #         in_b = snap["inbound"]["bytes"]
-    #         out_b = snap["outbound"]["bytes"]
-    #         in_m = snap["inbound"]["msgs"]
-    #         out_m = snap["outbound"]["msgs"]
-    #         win = snap["window_seconds"]
-    #         in_rate = in_b / win if win > 0 else 0.0
-    #         out_rate = out_b / win if win > 0 else 0.0
-    #
-    #         logger.info(
-    #             "[OVERHEAD] window=%.2fs  IN: %d bytes (%d msgs, %.1f B/s)  "
-    #             "OUT: %d bytes (%d msgs, %.1f B/s)  cats_in=%s  cats_out=%s",
-    #             win, in_b, in_m, in_rate, out_b, out_m, out_rate,
-    #             {k: v["bytes"] for k, v in snap["by_category_in"].items()},
-    #             {k: v["bytes"] for k, v in snap["by_category_out"].items()},
-    #         )
-    #
-    #         # Optionally publish a JSON snapshot (excluded from overhead counting)
-    #         if self._publish_metrics:
-    #             try:
-    #                 self.coord_client.publish(topic_metrics, json.dumps(snap), qos=0)
-    #             except Exception as e:
-    #                 logger.warning(f"Failed to publish overhead metrics: {e}")
     def _overhead_reporter(self):
         """Every window (default 5s), log + append one CSV row with overhead metrics."""
         topic_metrics = "coordinator/metrics/overhead"
