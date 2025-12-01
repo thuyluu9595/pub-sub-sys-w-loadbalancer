@@ -33,7 +33,7 @@ class BrokerInfo:
     data_rate: float
     utilization: float = 0.0
     topics: Set[str] = None
-    
+
     def __post_init__(self):
         if self.topics is None:
             self.topics = set()
@@ -41,6 +41,7 @@ class BrokerInfo:
 
 class TrieNode:
     """Trie node for hierarchical topic storage"""
+
     def __init__(self):
         self.children = {}
         self.is_topic = False
@@ -51,9 +52,10 @@ class TrieNode:
 
 class TopicTrie:
     """Trie data structure for efficient topic matching and management"""
+
     def __init__(self):
         self.root = TrieNode()
-    
+
     def insert(self, topic: str, subscriber_id: str = None):
         """Insert a topic into the Trie"""
         node = self.root
@@ -64,7 +66,7 @@ class TopicTrie:
         node.is_topic = True
         if subscriber_id:
             node.subscribers.add(subscriber_id)
-    
+
     def search(self, topic: str) -> TrieNode:
         """Search for a topic in the Trie"""
         node = self.root
@@ -73,7 +75,7 @@ class TopicTrie:
                 return None
             node = node.children[level]
         return node if node.is_topic else None
-    
+
     def update_stats(self, topic: str, request_rate: float):
         """Update topic statistics"""
         node = self.search(topic)
@@ -87,17 +89,18 @@ class HotTopicDetector:
     Hot Topic Detection using Local Outlier Probability (LoOP)
     Based on Section III-A of the paper
     """
+
     def __init__(self, k_neighbors: int = 5, lambda_param: float = 3.0):
         self.k_neighbors = k_neighbors
         self.lambda_param = lambda_param
-    
+
     def compute_pdist(self, point: float, context: List[float]) -> float:
         """Compute probabilistic distance"""
         if not context:
             return 0.0
         distances = [abs(point - c) for c in context]
         return np.mean(distances) if distances else 0.0
-    
+
     def compute_plof(self, request_rates: Dict[str, float]) -> Dict[str, float]:
         """
         Compute Probabilistic Local Outlier Factor (PLOF)
@@ -105,65 +108,65 @@ class HotTopicDetector:
         """
         if len(request_rates) < 2:
             return {topic: 0.0 for topic in request_rates}
-        
+
         topics = list(request_rates.keys())
         rates = list(request_rates.values())
         plof_scores = {}
-        
+
         for topic, rate in request_rates.items():
             # Get k-nearest neighbors based on request rate
-            distances = [(other_topic, abs(rate - other_rate)) 
-                        for other_topic, other_rate in request_rates.items() 
-                        if other_topic != topic]
+            distances = [(other_topic, abs(rate - other_rate))
+                         for other_topic, other_rate in request_rates.items()
+                         if other_topic != topic]
             distances.sort(key=lambda x: x[1])
             context = [request_rates[t] for t, _ in distances[:self.k_neighbors]]
-            
+
             # Compute PLOF
             pdist_k = self.compute_pdist(rate, context)
             expected_pdist = np.mean([self.compute_pdist(c, context) for c in context])
-            
+
             if expected_pdist > 0:
                 plof = (pdist_k / expected_pdist) - 1
             else:
                 plof = 0.0
-            
+
             plof_scores[topic] = max(0.0, plof)
-        
+
         return plof_scores
-    
+
     def compute_loop(self, request_rates: Dict[str, float], threshold: float = 0.4) -> Set[str]:
         """
         Compute Local Outlier Probability (LoOP)
         Returns set of hot topics
         """
         plof_scores = self.compute_plof(request_rates)
-        
+
         if not plof_scores:
             return set()
-        
+
         # Compute nPLOF (normalized PLOF)
         plof_values = list(plof_scores.values())
-        nplof = self.lambda_param * np.sqrt(np.mean([p**2 for p in plof_values]))
-        
+        nplof = self.lambda_param * np.sqrt(np.mean([p ** 2 for p in plof_values]))
+
         # Compute LoOP for each topic
         loop_scores = {}
         hot_topics = set()
-        
+
         for topic, plof in plof_scores.items():
             if nplof > 0:
                 loop_score = max(0, erf(plof / (nplof * np.sqrt(2))))
             else:
                 loop_score = 0.0
-            
+
             loop_scores[topic] = loop_score
-            
+
             # Mark as hot topic if LoOP score is high
             if loop_score >= threshold:
                 hot_topics.add(topic)
-        
+
         logger.info(f"LoOP Scores: {loop_scores}")
         logger.info(f"Hot Topics detected: {hot_topics}")
-        
+
         return hot_topics
 
 
@@ -172,13 +175,14 @@ class LoadBalancer:
     Topic-Aware Load Balancing Algorithm
     Implements Algorithm 1 from the paper (Section III-D)
     """
+
     def __init__(self, brokers: List[BrokerInfo]):
         self.brokers = brokers
         self.trie = TopicTrie()
         self.hot_detector = HotTopicDetector()
         self.topic_stats = defaultdict(lambda: {'rate': 0.0, 'subscribers': 0})
         self.client_broker_map = {}  # X matrix: client -> broker assignment
-    
+
     def calculate_optimal_utilization(self, total_arrival_rate: float) -> Dict[int, float]:
         """
         Calculate optimal broker utilization Q*
@@ -186,41 +190,41 @@ class LoadBalancer:
         """
         total_service_rate = sum(b.data_rate for b in self.brokers)
         num_brokers = len(self.brokers)
-        
+
         optimal_util = {}
         for i, broker in enumerate(self.brokers):
             Q_optimal = 1 - (total_service_rate - total_arrival_rate) / (num_brokers * broker.data_rate)
             optimal_util[i] = max(0.0, min(0.99, Q_optimal))  # Keep stable (0 < Q < 1)
-        
+
         logger.info(f"Optimal Utilizations: {optimal_util}")
         return optimal_util
-    
+
     def calculate_cost_function(self, broker_idx: int, current_util: float, optimal_util: float) -> float:
         """
         Calculate cost function ν_i
         """
         return abs(optimal_util - current_util)
-    
+
     def allocation_matrix(self, hot_topics: Set[str], optimal_utils: Dict[int, float]) -> Dict[str, int]:
         """
         Algorithm 1: Topic-Aware Load Balancing
         Returns allocation: topic -> broker_index
         """
         allocation = {}
-        
+
         # Sort topics by popularity (request rate) in descending order
-        sorted_topics = sorted(hot_topics, 
-                             key=lambda t: self.topic_stats[t]['rate'], 
-                             reverse=True)
-        
+        sorted_topics = sorted(hot_topics,
+                               key=lambda t: self.topic_stats[t]['rate'],
+                               reverse=True)
+
         logger.info(f"Allocating {len(sorted_topics)} hot topics to brokers")
-        
+
         for topic in sorted_topics:
             # topic_rate = self.topic_stats[topic]['rate']
             topic_rate = self.topic_stats[topic]['rate'] * max(1, self.topic_stats[topic]['subscribers'])
             best_broker = None
             best_cost = float('inf')
-            
+
             # Find available broker with best cost function
             for i, broker in enumerate(self.brokers):
                 current_load = sum(
@@ -232,31 +236,31 @@ class LoadBalancer:
                     # Calculate new utilization if topic is assigned
                     new_util = (current_load + topic_rate) / broker.data_rate
                     cost = self.calculate_cost_function(i, new_util, optimal_utils[i])
-                    
+
                     if cost < best_cost:
                         best_cost = cost
                         best_broker = i
-            
+
             if best_broker is not None:
                 allocation[topic] = best_broker
                 self.brokers[best_broker].topics.add(topic)
                 logger.info(f"Allocated topic '{topic}' (rate={topic_rate:.2f}) to broker {best_broker}")
             else:
                 # Fallback: assign to least loaded broker
-                least_loaded = min(range(len(self.brokers)), 
-                                 key=lambda i: len(self.brokers[i].topics))
+                least_loaded = min(range(len(self.brokers)),
+                                   key=lambda i: len(self.brokers[i].topics))
                 allocation[topic] = least_loaded
                 self.brokers[least_loaded].topics.add(topic)
                 logger.warning(f"Fallback allocation: topic '{topic}' to broker {least_loaded}")
-        
+
         return allocation
-    
+
     def update_topic_stats(self, topic: str, rate: float, num_subscribers: int):
         """Update topic statistics for hot topic detection"""
         self.topic_stats[topic]['rate'] = rate
         self.topic_stats[topic]['subscribers'] = num_subscribers
         self.trie.update_stats(topic, rate)
-    
+
     def detect_and_balance(self):
         """Main load balancing routine"""
         # Get all topics with their request rates
@@ -267,18 +271,18 @@ class LoadBalancer:
             load = stats.get('rate', 0.0) * stats.get('subscribers', 0)
             if load > 0:
                 request_rates[topic] = load
-        
+
         if not request_rates:
             logger.info("No topics to balance")
             return {}
-        
+
         # Step 1: Detect hot topics using LoOP
         hot_topics = self.hot_detector.compute_loop(request_rates)
-        
+
         if not hot_topics:
             logger.info("No hot topics detected")
             return {}
-        
+
         # Step 2: Calculate optimal utilization
         total_rate = sum(request_rates.values())
         optimal_utils = self.calculate_optimal_utilization(total_rate)
@@ -289,7 +293,7 @@ class LoadBalancer:
 
         # Step 3: Run allocation algorithm
         allocation = self.allocation_matrix(hot_topics, optimal_utils)
-        
+
         # Step 4: Update broker utilizations
         for i, broker in enumerate(self.brokers):
             # load = sum(self.topic_stats[t]['rate'] for t in broker.topics
@@ -298,8 +302,8 @@ class LoadBalancer:
                 for t in broker.topics
             )
             broker.utilization = load / broker.data_rate if broker.data_rate > 0 else 0.0
-            logger.info(f"Broker {broker.host} utilization: {broker.utilization:.2%}")
-        
+            logger.info(f"Broker {i} utilization: {broker.utilization:.2%}")
+
         return allocation
 
 
@@ -313,6 +317,7 @@ class OverheadMonitor:
       - stats_in (incoming stats)
       - migrate_out (outgoing migration cmds), if caller provides ctx_topic
     """
+
     def __init__(self, window_s: float = 10.0):
         self.window_s = max(1.0, float(window_s))
         self.lock = threading.Lock()
@@ -347,26 +352,38 @@ class OverheadMonitor:
         """Count incoming message. We include topic bytes + payload bytes."""
         byte_count = int(payload_len) + len(topic_str or "")
         with self.lock:
-            self.cum_in["bytes"] += byte_count; self.cum_in["msgs"] += 1
-            self.win_in["bytes"] += byte_count; self.win_in["msgs"] += 1
+            self.cum_in["bytes"] += byte_count;
+            self.cum_in["msgs"] += 1
+            self.win_in["bytes"] += byte_count;
+            self.win_in["msgs"] += 1
             self._add(self.cum_by_cat_in, category, byte_count)
             self._add(self.win_by_cat_in, category, byte_count)
             if per_topic and category == "stats_in":
-                t = self.cum_per_topic[per_topic]; t["stats_in_bytes"] += byte_count; t["stats_in_msgs"] += 1
-                w = self.win_per_topic[per_topic]; w["stats_in_bytes"] += byte_count; w["stats_in_msgs"] += 1
+                t = self.cum_per_topic[per_topic];
+                t["stats_in_bytes"] += byte_count;
+                t["stats_in_msgs"] += 1
+                w = self.win_per_topic[per_topic];
+                w["stats_in_bytes"] += byte_count;
+                w["stats_in_msgs"] += 1
 
     def record_out(self, category: str, topic_str: str, payload_len: int, *, per_topic: str | None = None):
         """Count outgoing message. We include topic bytes + payload bytes."""
         # Note: caller should avoid counting internal metrics publications to prevent feedback.
         byte_count = int(payload_len) + len(topic_str or "")
         with self.lock:
-            self.cum_out["bytes"] += byte_count; self.cum_out["msgs"] += 1
-            self.win_out["bytes"] += byte_count; self.win_out["msgs"] += 1
+            self.cum_out["bytes"] += byte_count;
+            self.cum_out["msgs"] += 1
+            self.win_out["bytes"] += byte_count;
+            self.win_out["msgs"] += 1
             self._add(self.cum_by_cat_out, category, byte_count)
             self._add(self.win_by_cat_out, category, byte_count)
             if per_topic and category == "migrate_out":
-                t = self.cum_per_topic[per_topic]; t["migrate_out_bytes"] += byte_count; t["migrate_out_msgs"] += 1
-                w = self.win_per_topic[per_topic]; w["migrate_out_bytes"] += byte_count; w["migrate_out_msgs"] += 1
+                t = self.cum_per_topic[per_topic];
+                t["migrate_out_bytes"] += byte_count;
+                t["migrate_out_msgs"] += 1
+                w = self.win_per_topic[per_topic];
+                w["migrate_out_bytes"] += byte_count;
+                w["migrate_out_msgs"] += 1
 
     def snapshot_and_reset_window(self) -> dict:
         """Return a snapshot for the last window and reset window counters."""
@@ -483,14 +500,14 @@ class CoordinationService:
             ("broker3", 1883, 550),
             ("broker4", 1883, 600),
         ]
-        
+
         brokers = []
         for host, port, capacity in broker_configs:
             # Convert capacity (Mbps) to effective data rate
             # Assuming average message size of 550KB
             data_rate = capacity * 1024 / (550 * 8)  # messages per second
             brokers.append(BrokerInfo(host, port, capacity, data_rate))
-        
+
         return brokers
 
     def _on_broker_connect(self, client, userdata, flags, rc, broker_idx):
@@ -509,7 +526,7 @@ class CoordinationService:
             client = mqtt.Client(f"coordinator_broker{i}")
             client.on_connect = lambda c, u, f, rc, idx=i: self._on_broker_connect(c, u, f, rc, idx)
             client.on_message = self._on_broker_message
-            
+
             try:
                 client.connect(broker.host, broker.port, 60)
                 client.loop_start()
@@ -517,7 +534,7 @@ class CoordinationService:
                 logger.info(f"Connected to broker {i} at {broker.host}:{broker.port}")
             except Exception as e:
                 logger.error(f"Failed to connect to broker {i}: {e}")
-    
+
     def _connect_coordination_broker(self):
         """Connect to broker1 for coordination messages"""
         try:
@@ -526,7 +543,7 @@ class CoordinationService:
             logger.info(f"Coordination client connected to control broker {self.ctrl_host}")
         except Exception as e:
             logger.error(f"Failed to connect coordination client: {e}")
-    
+
     def _on_coord_connect(self, client, userdata, flags, rc):
         """Callback when coordination client connects"""
         logger.info(f"Coordinator connected with result code {rc}")
@@ -567,7 +584,7 @@ class CoordinationService:
             elif topic_parts[1] == 'stats':
                 # INCOMING control-plane: stats (attribute per-topic)
                 full_topic = "/".join(topic_parts[2:]) if len(topic_parts) > 2 else None
-                self.overhead.record_in('stats_in', msg.topic, len(msg.payload), per_topic = full_topic)
+                self.overhead.record_in('stats_in', msg.topic, len(msg.payload), per_topic=full_topic)
 
                 payload = json.loads(msg.payload.decode())
                 topic = payload.get('topic', full_topic)
@@ -619,7 +636,7 @@ class CoordinationService:
                     done.append(cid)
             for cid in done:
                 pending.discard(cid)
-            time.sleep(0.05)
+            time.sleep(0.05)  # tiny poll interval
 
         if pending:
             logger.warning(f"Timed out waiting for ACKs from: {sorted(pending)}")
@@ -645,6 +662,36 @@ class CoordinationService:
         except Exception as e:
             logger.warning(f"Could not prepare CSV header at {self._csv_path}: {e}")
 
+    # def _overhead_reporter(self):
+    #     """Periodically log and (optionally) publish control-plane overhead snapshots."""
+    #     topic_metrics = "coordinator/metrics/overhead"
+    #     while True:
+    #         time.sleep(self.overhead.window_s)
+    #         snap = self.overhead.snapshot_and_reset_window()
+    #
+    #         # Pretty log
+    #         in_b = snap["inbound"]["bytes"]
+    #         out_b = snap["outbound"]["bytes"]
+    #         in_m = snap["inbound"]["msgs"]
+    #         out_m = snap["outbound"]["msgs"]
+    #         win = snap["window_seconds"]
+    #         in_rate = in_b / win if win > 0 else 0.0
+    #         out_rate = out_b / win if win > 0 else 0.0
+    #
+    #         logger.info(
+    #             "[OVERHEAD] window=%.2fs  IN: %d bytes (%d msgs, %.1f B/s)  "
+    #             "OUT: %d bytes (%d msgs, %.1f B/s)  cats_in=%s  cats_out=%s",
+    #             win, in_b, in_m, in_rate, out_b, out_m, out_rate,
+    #             {k: v["bytes"] for k, v in snap["by_category_in"].items()},
+    #             {k: v["bytes"] for k, v in snap["by_category_out"].items()},
+    #         )
+    #
+    #         # Optionally publish a JSON snapshot (excluded from overhead counting)
+    #         if self._publish_metrics:
+    #             try:
+    #                 self.coord_client.publish(topic_metrics, json.dumps(snap), qos=0)
+    #             except Exception as e:
+    #                 logger.warning(f"Failed to publish overhead metrics: {e}")
     def _overhead_reporter(self):
         """Every window (default 5s), log + append one CSV row with overhead metrics."""
         topic_metrics = "coordinator/metrics/overhead"
@@ -736,21 +783,24 @@ class CoordinationService:
         except Exception as e:
             logger.error(f"Failed to send migration command: {e}")
 
-    def register_publisher(self, client_id: str, topics: List[str], rates: Dict[str, float], broker_host: str, broker_port: int):
+    def register_publisher(self, client_id: str, topics: List[str], rates: Dict[str, float], broker_host: str,
+                           broker_port: int):
         """Register a publisher with its topics and rates"""
         with self.lock:
-            self.clients[client_id] = {'type': 'publisher', 'topics': topics, 'broker_host': broker_host, 'broker_port': broker_port}
-            
+            self.clients[client_id] = {'type': 'publisher', 'topics': topics, 'broker_host': broker_host,
+                                       'broker_port': broker_port}
+
             for topic in topics:
                 rate = rates.get(topic, 1.0)
                 self.load_balancer.update_topic_stats(topic, rate, 0)
                 self.load_balancer.trie.insert(topic)
-    
+
     def register_subscriber(self, client_id: str, topics: List[str], broker_host: str, broker_port: int):
         """Register a subscriber with its topic subscriptions"""
         with self.lock:
-            self.clients[client_id] = {'type': 'subscriber', 'topics': topics, 'broker_host': broker_host, 'broker_port': broker_port}
-            
+            self.clients[client_id] = {'type': 'subscriber', 'topics': topics, 'broker_host': broker_host,
+                                       'broker_port': broker_port}
+
             for topic in topics:
                 current_subs = self.load_balancer.topic_stats[topic]['subscribers']
                 self.load_balancer.topic_stats[topic]['subscribers'] = current_subs + 1
@@ -799,13 +849,13 @@ class CoordinationService:
 def main():
     """Main entry point"""
     logger.info("Starting Coordination Service...")
-    
+
     coordinator = CoordinationService()
-    
+
     # Start balancing thread
     balance_thread = threading.Thread(target=coordinator.run_balancing_cycle, daemon=True)
     balance_thread.start()
-    
+
     # Keep service running
     try:
         while True:
