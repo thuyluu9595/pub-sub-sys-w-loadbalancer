@@ -461,36 +461,36 @@ class CoordinationService:
         self._oh_thread = threading.Thread(target=self._overhead_reporter, daemon=True)
         self._oh_thread.start()
 
-    def _overhead_reporter(self):
-        """Periodically log and (optionally) publish control-plane overhead snapshots."""
-        topic_metrics = "coordinator/metrics/overhead"
-        while True:
-            time.sleep(self.overhead.window_s)
-            snap = self.overhead.snapshot_and_reset_window()
-
-            # Pretty log
-            in_b = snap["inbound"]["bytes"];
-            out_b = snap["outbound"]["bytes"]
-            in_m = snap["inbound"]["msgs"];
-            out_m = snap["outbound"]["msgs"]
-            win = snap["window_seconds"]
-            in_rate = in_b / win if win > 0 else 0.0
-            out_rate = out_b / win if win > 0 else 0.0
-
-            logger.info(
-                "[OVERHEAD] window=%.2fs  IN: %d bytes (%d msgs, %.1f B/s)  "
-                "OUT: %d bytes (%d msgs, %.1f B/s)  cats_in=%s  cats_out=%s",
-                win, in_b, in_m, in_rate, out_b, out_m, out_rate,
-                {k: v["bytes"] for k, v in snap["by_category_in"].items()},
-                {k: v["bytes"] for k, v in snap["by_category_out"].items()},
-            )
-
-            # Optionally publish a JSON snapshot (excluded from overhead counting)
-            if self._publish_metrics:
-                try:
-                    self.coord_client.publish(topic_metrics, json.dumps(snap), qos=0)
-                except Exception as e:
-                    logger.warning(f"Failed to publish overhead metrics: {e}")
+    # def _overhead_reporter(self):
+    #     """Periodically log and (optionally) publish control-plane overhead snapshots."""
+    #     topic_metrics = "coordinator/metrics/overhead"
+    #     while True:
+    #         time.sleep(self.overhead.window_s)
+    #         snap = self.overhead.snapshot_and_reset_window()
+    #
+    #         # Pretty log
+    #         in_b = snap["inbound"]["bytes"];
+    #         out_b = snap["outbound"]["bytes"]
+    #         in_m = snap["inbound"]["msgs"];
+    #         out_m = snap["outbound"]["msgs"]
+    #         win = snap["window_seconds"]
+    #         in_rate = in_b / win if win > 0 else 0.0
+    #         out_rate = out_b / win if win > 0 else 0.0
+    #
+    #         logger.info(
+    #             "[OVERHEAD] window=%.2fs  IN: %d bytes (%d msgs, %.1f B/s)  "
+    #             "OUT: %d bytes (%d msgs, %.1f B/s)  cats_in=%s  cats_out=%s",
+    #             win, in_b, in_m, in_rate, out_b, out_m, out_rate,
+    #             {k: v["bytes"] for k, v in snap["by_category_in"].items()},
+    #             {k: v["bytes"] for k, v in snap["by_category_out"].items()},
+    #         )
+    #
+    #         # Optionally publish a JSON snapshot (excluded from overhead counting)
+    #         if self._publish_metrics:
+    #             try:
+    #                 self.coord_client.publish(topic_metrics, json.dumps(snap), qos=0)
+    #             except Exception as e:
+    #                 logger.warning(f"Failed to publish overhead metrics: {e}")
 
     def _init_brokers(self) -> List[BrokerInfo]:
         """Initialize broker information"""
@@ -531,7 +531,7 @@ class CoordinationService:
                 client.connect(broker.host, broker.port, 60)
                 client.loop_start()
                 self.broker_clients[i] = client
-                logger.info(f"Connected to broker {i} at {broker.host}:{broker.port}")
+                logger.info(f"Connected to broker {broker.host}:{broker.port}")
             except Exception as e:
                 logger.error(f"Failed to connect to broker {i}: {e}")
 
@@ -721,8 +721,8 @@ class CoordinationService:
 
             # Paper buckets (derived):
             init_bytes = reg_b  # you can add first-window stats if you want
-            mapping_bytes = mig_b + ack_b
-            reassignment_bytes = mapping_bytes  # in this implementation, reassignment is migrate+ack
+            mapping_bytes = mig_b
+            reassignment_bytes = mig_b + ack_b
 
             # Log summary
             logger.info(
