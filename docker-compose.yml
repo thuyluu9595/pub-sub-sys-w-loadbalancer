@@ -117,7 +117,7 @@ services:
       - CONTROL_PORT=1883
       - PLAN_FILE=/app/plan.csv
       - PLAN_FORMAT=csv
-      - SUBSCRIBE_MODE=all         # all or targeted
+      - SUBSCRIBE_MODE=all
       - HOT_RATE_THRESHOLD=0.4
       - MIN_SUBS_PER_HOT=1
       - MAX_TOPICS_PER_SUB=2
