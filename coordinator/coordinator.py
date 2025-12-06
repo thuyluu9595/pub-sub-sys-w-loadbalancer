@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-"""
-Coordination Service implementing:
-- Hot Topic Detection using LoOP (Local Outlier Probability)
-- Topic-Aware Load Balancing (Algorithm 1 from paper)
-- Trie data structure for topic management
-"""
 
 import numpy as np
 import paho.mqtt.client as mqtt
@@ -181,12 +175,11 @@ class LoadBalancer:
         self.trie = TopicTrie()
         self.hot_detector = HotTopicDetector()
         self.topic_stats = defaultdict(lambda: {'rate': 0.0, 'subscribers': 0})
-        self.client_broker_map = {}  # X matrix: client -> broker assignment
+        self.client_broker_map = {}
 
     def calculate_optimal_utilization(self, total_arrival_rate: float) -> Dict[int, float]:
         """
         Calculate optimal broker utilization Q*
-        Equation (15) from the paper
         """
         total_service_rate = sum(b.data_rate for b in self.brokers)
         num_brokers = len(self.brokers)
@@ -194,9 +187,8 @@ class LoadBalancer:
         optimal_util = {}
         for i, broker in enumerate(self.brokers):
             Q_optimal = 1 - (total_service_rate - total_arrival_rate) / (num_brokers * broker.data_rate)
-            optimal_util[i] = max(0.0, min(0.99, Q_optimal))  # Keep stable (0 < Q < 1)
+            optimal_util[i] = max(0.0, min(0.99, Q_optimal))
 
-        logger.info(f"Optimal Utilizations: {optimal_util}")
         return optimal_util
 
     def calculate_cost_function(self, broker_idx: int, current_util: float, optimal_util: float) -> float:
@@ -244,7 +236,7 @@ class LoadBalancer:
             if best_broker is not None:
                 allocation[topic] = best_broker
                 self.brokers[best_broker].topics.add(topic)
-                logger.info(f"Allocated topic '{topic}' (rate={topic_rate:.2f}) to broker {best_broker}")
+                logger.info(f"Allocated topic '{topic}' (rate={topic_rate:.2f}) to broker {self.brokers[best_broker].host}")
             else:
                 # Fallback: assign to least loaded broker
                 least_loaded = min(range(len(self.brokers)),
@@ -302,7 +294,7 @@ class LoadBalancer:
                 for t in broker.topics
             )
             broker.utilization = load / broker.data_rate if broker.data_rate > 0 else 0.0
-            logger.info(f"Broker {i} utilization: {broker.utilization:.2%}")
+            # logger.info(f"Broker {i} utilization: {broker.utilization:.2%}")
 
         return allocation
 
@@ -310,12 +302,6 @@ class LoadBalancer:
 class OverheadMonitor:
     """
     Tracks control-plane overhead in bytes/messages by category and per topic.
-    Categories we track:
-      - IN:  'register_in', 'stats_in', 'ack_in', 'other_in'
-      - OUT: 'migrate_out', 'other_out'
-    Per-topic we attribute:
-      - stats_in (incoming stats)
-      - migrate_out (outgoing migration cmds), if caller provides ctx_topic
     """
 
     def __init__(self, window_s: float = 10.0):
@@ -449,9 +435,9 @@ class CoordinationService:
         # fixed schema so you can analyze easily later
         self._csv_fields = [
             "ts_iso", "window_seconds",
-            "in_bytes", "in_msgs", "out_bytes", "out_msgs",
-            "register_in_bytes", "stats_in_bytes", "ack_in_bytes", "other_in_bytes",
-            "migrate_out_bytes", "other_out_bytes",
+            # "in_bytes", "in_msgs", "out_bytes", "out_msgs",
+            # "register_in_bytes", "stats_in_bytes", "ack_in_bytes", "other_in_bytes",
+            # "migrate_out_bytes", "other_out_bytes",
             # paper-style buckets for convenience:
             "init_bytes", "mapping_bytes", "reassignment_bytes"
         ]
@@ -607,10 +593,10 @@ class CoordinationService:
                 pending.discard(cid)
             time.sleep(0.05)  # tiny poll interval
 
-        if pending:
-            logger.warning(f"Timed out waiting for ACKs from: {sorted(pending)}")
-        else:
-            logger.info("All ACKs received.")
+        # if pending:
+        #     logger.warning(f"Timed out waiting for ACKs from: {sorted(pending)}")
+        # else:
+        #     logger.info("All ACKs received.")
         return list(pending)
 
     def _ensure_csv_header(self):
@@ -631,36 +617,6 @@ class CoordinationService:
         except Exception as e:
             logger.warning(f"Could not prepare CSV header at {self._csv_path}: {e}")
 
-    # def _overhead_reporter(self):
-    #     """Periodically log and (optionally) publish control-plane overhead snapshots."""
-    #     topic_metrics = "coordinator/metrics/overhead"
-    #     while True:
-    #         time.sleep(self.overhead.window_s)
-    #         snap = self.overhead.snapshot_and_reset_window()
-    #
-    #         # Pretty log
-    #         in_b = snap["inbound"]["bytes"]
-    #         out_b = snap["outbound"]["bytes"]
-    #         in_m = snap["inbound"]["msgs"]
-    #         out_m = snap["outbound"]["msgs"]
-    #         win = snap["window_seconds"]
-    #         in_rate = in_b / win if win > 0 else 0.0
-    #         out_rate = out_b / win if win > 0 else 0.0
-    #
-    #         logger.info(
-    #             "[OVERHEAD] window=%.2fs  IN: %d bytes (%d msgs, %.1f B/s)  "
-    #             "OUT: %d bytes (%d msgs, %.1f B/s)  cats_in=%s  cats_out=%s",
-    #             win, in_b, in_m, in_rate, out_b, out_m, out_rate,
-    #             {k: v["bytes"] for k, v in snap["by_category_in"].items()},
-    #             {k: v["bytes"] for k, v in snap["by_category_out"].items()},
-    #         )
-    #
-    #         # Optionally publish a JSON snapshot (excluded from overhead counting)
-    #         if self._publish_metrics:
-    #             try:
-    #                 self.coord_client.publish(topic_metrics, json.dumps(snap), qos=0)
-    #             except Exception as e:
-    #                 logger.warning(f"Failed to publish overhead metrics: {e}")
     def _overhead_reporter(self):
         """Every window (default 5s), log + append one CSV row with overhead metrics."""
         topic_metrics = "coordinator/metrics/overhead"
@@ -716,11 +672,11 @@ class CoordinationService:
                 with open(self._csv_path, "a", newline="") as f:
                     w = csv.writer(f)
                     w.writerow([
-                        time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),  # ts_iso (UTC)
+                        time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
                         f"{win:.2f}",
-                        in_b, in_m, out_b, out_m,
-                        reg_b, sts_b, ack_b, oth_in,
-                        mig_b, oth_out,
+                        # in_b, in_m, out_b, out_m,
+                        # reg_b, sts_b, ack_b, oth_in,
+                        # mig_b, oth_out,
                         init_bytes, mapping_bytes, reassignment_bytes
                     ])
             except Exception as e:
