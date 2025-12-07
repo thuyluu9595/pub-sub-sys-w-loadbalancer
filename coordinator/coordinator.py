@@ -197,11 +197,65 @@ class LoadBalancer:
         """
         return abs(optimal_util - current_util)
 
-    def allocation_matrix(self, hot_topics: Set[str], optimal_utils: Dict[int, float]) -> Dict[str, int]:
+    # def allocation_matrix(self, hot_topics: Set[str], optimal_utils: Dict[int, float]) -> Dict[str, int]:
+    #     """
+    #     Algorithm 1: Topic-Aware Load Balancing
+    #     Returns allocation: topic -> broker_index
+    #     """
+    #     allocation = {}
+    #
+    #     # Sort topics by popularity (request rate) in descending order
+    #     sorted_topics = sorted(hot_topics,
+    #                            key=lambda t: self.topic_stats[t]['rate'],
+    #                            reverse=True)
+    #
+    #     logger.info(f"Allocating {len(sorted_topics)} hot topics to brokers")
+    #
+    #     for topic in sorted_topics:
+    #         # topic_rate = self.topic_stats[topic]['rate']
+    #         topic_rate = self.topic_stats[topic]['rate'] * max(1, self.topic_stats[topic]['subscribers'])
+    #         best_broker = None
+    #         best_cost = float('inf')
+    #
+    #         # Find available broker with best cost function
+    #         for i, broker in enumerate(self.brokers):
+    #             current_load = sum(
+    #                 self.topic_stats[t]['rate'] * max(1, self.topic_stats[t]['subscribers'])
+    #                 for t in broker.topics
+    #             )
+    #
+    #             if current_load + topic_rate < broker.data_rate:
+    #                 # Calculate new utilization if topic is assigned
+    #                 new_util = (current_load + topic_rate) / broker.data_rate
+    #                 cost = self.calculate_cost_function(i, new_util, optimal_utils[i])
+    #
+    #                 if cost < best_cost:
+    #                     best_cost = cost
+    #                     best_broker = i
+    #
+    #         if best_broker is not None:
+    #             allocation[topic] = best_broker
+    #             self.brokers[best_broker].topics.add(topic)
+    #             logger.info(f"Allocated topic '{topic}' (rate={topic_rate:.2f}) to broker {self.brokers[best_broker].host}")
+    #         else:
+    #             # Fallback: assign to least loaded broker
+    #             least_loaded = min(range(len(self.brokers)),
+    #                                key=lambda i: len(self.brokers[i].topics))
+    #             allocation[topic] = least_loaded
+    #             self.brokers[least_loaded].topics.add(topic)
+    #             logger.warning(f"Fallback allocation: topic '{topic}' to broker {least_loaded}")
+    #
+    #     return allocation
+
+    def allocation_matrix(self, hot_topics: Set[str], optimal_utils: Dict[int, float],
+                          current_locations: Dict[str, int] = None) -> Dict[str, int]:
         """
-        Algorithm 1: Topic-Aware Load Balancing
+        Algorithm 1: Topic-Aware Load Balancing with Hysteresis
         Returns allocation: topic -> broker_index
         """
+        if current_locations is None:
+            current_locations = {}
+
         allocation = {}
 
         # Sort topics by popularity (request rate) in descending order
@@ -212,7 +266,6 @@ class LoadBalancer:
         logger.info(f"Allocating {len(sorted_topics)} hot topics to brokers")
 
         for topic in sorted_topics:
-            # topic_rate = self.topic_stats[topic]['rate']
             topic_rate = self.topic_stats[topic]['rate'] * max(1, self.topic_stats[topic]['subscribers'])
             best_broker = None
             best_cost = float('inf')
@@ -228,6 +281,9 @@ class LoadBalancer:
                     # Calculate new utilization if topic is assigned
                     new_util = (current_load + topic_rate) / broker.data_rate
                     cost = self.calculate_cost_function(i, new_util, optimal_utils[i])
+
+                    if current_locations.get(topic) == i:
+                        cost *= 0.8  # 20% discount to stay put
 
                     if cost < best_cost:
                         best_cost = cost
@@ -253,13 +309,57 @@ class LoadBalancer:
         self.topic_stats[topic]['subscribers'] = num_subscribers
         self.trie.update_stats(topic, rate)
 
+    # def detect_and_balance(self):
+    #     """Main load balancing routine"""
+    #     # Get all topics with their request rates
+    #     request_rates = {}
+    #     for topic, stats in self.topic_stats.items():
+    #         # This is the change: load = rate * subscribers
+    #         # This better reflects the paper's model
+    #         load = stats.get('rate', 0.0) * stats.get('subscribers', 0)
+    #         if load > 0:
+    #             request_rates[topic] = load
+    #
+    #     if not request_rates:
+    #         logger.info("No topics to balance")
+    #         return {}
+    #
+    #     # Step 1: Detect hot topics using LoOP
+    #     hot_topics = self.hot_detector.compute_loop(request_rates)
+    #
+    #     if not hot_topics:
+    #         logger.info("No hot topics detected")
+    #         return {}
+    #
+    #     # Step 2: Calculate optimal utilization
+    #     total_rate = sum(request_rates.values())
+    #     optimal_utils = self.calculate_optimal_utilization(total_rate)
+    #
+    #     # Reset per-cycle topic allocations to avoid accumulation
+    #     for b in self.brokers:
+    #         b.topics.clear()
+    #
+    #     # Step 3: Run allocation algorithm
+    #     allocation = self.allocation_matrix(hot_topics, optimal_utils)
+    #
+    #     # Step 4: Update broker utilizations
+    #     for i, broker in enumerate(self.brokers):
+    #         # load = sum(self.topic_stats[t]['rate'] for t in broker.topics
+    #         load = sum(
+    #             self.topic_stats[t]['rate'] * max(1, self.topic_stats[t]['subscribers'])
+    #             for t in broker.topics
+    #         )
+    #         broker.utilization = load / broker.data_rate if broker.data_rate > 0 else 0.0
+    #         # logger.info(f"Broker {i} utilization: {broker.utilization:.2%}")
+    #
+    #     return allocation
+
     def detect_and_balance(self):
         """Main load balancing routine"""
         # Get all topics with their request rates
         request_rates = {}
         for topic, stats in self.topic_stats.items():
-            # This is the change: load = rate * subscribers
-            # This better reflects the paper's model
+            # load = rate * subscribers
             load = stats.get('rate', 0.0) * stats.get('subscribers', 0)
             if load > 0:
                 request_rates[topic] = load
@@ -279,22 +379,27 @@ class LoadBalancer:
         total_rate = sum(request_rates.values())
         optimal_utils = self.calculate_optimal_utilization(total_rate)
 
+        # --- [NEW] Capture current topic locations for Hysteresis ---
+        current_locations = {}
+        for i, b in enumerate(self.brokers):
+            for t in b.topics:
+                current_locations[t] = i
+
         # Reset per-cycle topic allocations to avoid accumulation
         for b in self.brokers:
             b.topics.clear()
 
-        # Step 3: Run allocation algorithm
-        allocation = self.allocation_matrix(hot_topics, optimal_utils)
+        # Step 3: Run allocation algorithm (Passing current_locations)
+        allocation = self.allocation_matrix(hot_topics, optimal_utils, current_locations)
 
         # Step 4: Update broker utilizations
         for i, broker in enumerate(self.brokers):
-            # load = sum(self.topic_stats[t]['rate'] for t in broker.topics
             load = sum(
                 self.topic_stats[t]['rate'] * max(1, self.topic_stats[t]['subscribers'])
                 for t in broker.topics
             )
             broker.utilization = load / broker.data_rate if broker.data_rate > 0 else 0.0
-            # logger.info(f"Broker {i} utilization: {broker.utilization:.2%}")
+            logger.info(f"Broker {i} utilization: {broker.utilization:.2%}")
 
         return allocation
 
