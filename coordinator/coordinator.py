@@ -167,7 +167,7 @@ class HotTopicDetector:
 class LoadBalancer:
     """
     Topic-Aware Load Balancing Algorithm
-    Implements Algorithm 1 from the paper (Section III-D)
+    Implements Algorithm 1
     """
 
     def __init__(self, brokers: List[BrokerInfo]):
@@ -200,7 +200,6 @@ class LoadBalancer:
     def allocation_matrix(self, hot_topics: Set[str], optimal_utils: Dict[int, float]) -> Dict[str, int]:
         """
         Algorithm 1: Topic-Aware Load Balancing
-        Returns allocation: topic -> broker_index
         """
         allocation = {}
 
@@ -269,7 +268,7 @@ class LoadBalancer:
             return {}
 
         # Step 1: Detect hot topics using LoOP
-        hot_topics = self.hot_detector.compute_loop(request_rates)
+        hot_topics = self.hot_detector.compute_loop(request_rates, 0.4)
 
         if not hot_topics:
             logger.info("No hot topics detected")
@@ -288,13 +287,11 @@ class LoadBalancer:
 
         # Step 4: Update broker utilizations
         for i, broker in enumerate(self.brokers):
-            # load = sum(self.topic_stats[t]['rate'] for t in broker.topics
             load = sum(
                 self.topic_stats[t]['rate'] * max(1, self.topic_stats[t]['subscribers'])
                 for t in broker.topics
             )
             broker.utilization = load / broker.data_rate if broker.data_rate > 0 else 0.0
-            # logger.info(f"Broker {i} utilization: {broker.utilization:.2%}")
 
         return allocation
 

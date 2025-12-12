@@ -1,28 +1,4 @@
 #!/usr/bin/env python3
-"""
-Subscriber Application (plan-driven)
-- Reads the same plan (CSV/JSON) used by the publishers
-- Subscribes deterministically to those topics so "rate × subscribers" is non-zero,
-  helping hot-topic detection trigger reliably (with lowered LoOP threshold)
-
-Environment variables:
-  CONTROL_HOST=broker1
-  CONTROL_PORT=1883
-  PLAN_FILE=/app/plan.csv          # path to CSV or JSON plan
-  PLAN_FORMAT=csv                  # csv | json
-  NUM_SUBSCRIBERS=20
-  SUBSCRIBE_MODE=all               # all | targeted
-  HOT_RATE_THRESHOLD=0.8           # infer "hot" topics if SUBSCRIBE_MODE=targeted
-  MIN_SUBS_PER_HOT=6               # targeted mode: guaranteed subscribers for each hot topic
-  MAX_TOPICS_PER_SUB=8             # targeted mode: cap per-subscriber topic list size
-
-Notes:
-- "all" mode: every subscriber subscribes to all plan topics (simplest, ensures
-  subscribers > 0 for all topics; detection then depends on rate differences).
-- "targeted" mode: infer hot topics by max rate across phases >= HOT_RATE_THRESHOLD,
-  ensure at least MIN_SUBS_PER_HOT subscribers per hot topic; fill remaining slots
-  with non-hot topics up to MAX_TOPICS_PER_SUB.
-"""
 
 import paho.mqtt.client as mqtt
 import json
